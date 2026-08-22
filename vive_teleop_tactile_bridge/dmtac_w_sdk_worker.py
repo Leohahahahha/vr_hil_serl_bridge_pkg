@@ -8,6 +8,7 @@ left/right samples to fixed mmap files in /dev/shm.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import importlib.metadata
 import platform
 import signal
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-frame-path", default="/dev/shm/dmtac_w_left.frame")
     parser.add_argument("--right-frame-path", default="/dev/shm/dmtac_w_right.frame")
     parser.add_argument("--session-id", required=True, type=int)
-    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--startup-timeout-sec", type=float, default=60.0)
     parser.add_argument("--warmup-cycles", type=int, default=3)
     parser.add_argument("--show-sdk-fps", action="store_true")
@@ -66,6 +67,27 @@ def _sample_sensor(sensor: Any) -> tuple[int, int, bytes]:
     capture_end_ns = time.time_ns()
     payload = pack_modalities(arrays)
     return capture_start_ns, capture_end_ns, payload
+
+
+def _sample_sensors_parallel(
+    sensors: dict[str, Any], executor: ThreadPoolExecutor
+) -> dict[str, tuple[int, int, bytes]]:
+    """Read left/right sensors concurrently; getters within one sensor stay serial."""
+    futures = {
+        side: executor.submit(_sample_sensor, sensor)
+        for side, sensor in sensors.items()
+    }
+    samples: dict[str, tuple[int, int, bytes]] = {}
+    errors: list[tuple[str, BaseException]] = []
+    for side, future in futures.items():
+        try:
+            samples[side] = future.result()
+        except BaseException as exc:
+            errors.append((side, exc))
+    if errors:
+        side, exc = errors[0]
+        raise RuntimeError(f"{side} DM-Tac sampling failed: {exc!r}") from exc
+    return samples
 
 
 def _statuses(sensors: dict[str, Any]) -> dict[str, int]:
@@ -106,20 +128,23 @@ def _warm_up(
     *,
     cycles: int,
     stop_event: threading.Event,
+    executor: ThreadPoolExecutor,
 ) -> None:
     print(
         f"[SDK] warming up {cycles} cycle(s); these samples are discarded",
         flush=True,
     )
     for cycle in range(cycles):
-        for side, sensor in sensors.items():
-            if stop_event.is_set():
-                raise InterruptedError("worker stopped during warmup")
-            started = time.monotonic()
-            _sample_sensor(sensor)
-            elapsed_ms = (time.monotonic() - started) * 1000.0
+        if stop_event.is_set():
+            raise InterruptedError("worker stopped during warmup")
+        started = time.monotonic()
+        samples = _sample_sensors_parallel(sensors, executor)
+        pair_elapsed_ms = (time.monotonic() - started) * 1000.0
+        for side, (capture_start_ns, capture_end_ns, _payload) in samples.items():
+            elapsed_ms = (capture_end_ns - capture_start_ns) / 1_000_000.0
             print(
-                f"[SDK] warmup cycle={cycle} side={side} elapsed_ms={elapsed_ms:.2f}",
+                f"[SDK] warmup cycle={cycle} side={side} elapsed_ms={elapsed_ms:.2f} "
+                f"pair_ms={pair_elapsed_ms:.2f}",
                 flush=True,
             )
 
@@ -168,6 +193,7 @@ def run(args: argparse.Namespace) -> int:
         "right": MMapFrameWriter(args.right_frame_path, session_id=args.session_id),
     }
     sensors: dict[str, Any] = {}
+    sampler_pool: ThreadPoolExecutor | None = None
     try:
         print(
             "[SDK] opening sensors; keep both tactile surfaces completely unloaded "
@@ -191,10 +217,12 @@ def run(args: argparse.Namespace) -> int:
             stop_event=stop_event,
             timeout_sec=args.startup_timeout_sec,
         )
+        sampler_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dmtac-sensor")
         _warm_up(
             sensors,
             cycles=args.warmup_cycles,
             stop_event=stop_event,
+            executor=sampler_pool,
         )
 
         print(
@@ -210,10 +238,8 @@ def run(args: argparse.Namespace) -> int:
 
         while not stop_event.is_set():
             pair_started = time.monotonic()
-            samples: dict[str, tuple[int, int, bytes]] = {}
             try:
-                for side, sensor in sensors.items():
-                    samples[side] = _sample_sensor(sensor)
+                samples = _sample_sensors_parallel(sensors, sampler_pool)
             except Exception:
                 # A getter can fail if the device starts an internal reset. If
                 # the status confirms that case, discard the whole pair and
@@ -230,7 +256,12 @@ def run(args: argparse.Namespace) -> int:
                         stop_event=stop_event,
                         timeout_sec=args.startup_timeout_sec,
                     )
-                    _warm_up(sensors, cycles=args.warmup_cycles, stop_event=stop_event)
+                    _warm_up(
+                        sensors,
+                        cycles=args.warmup_cycles,
+                        stop_event=stop_event,
+                        executor=sampler_pool,
+                    )
                     next_deadline = time.monotonic()
                     continue
                 raise
@@ -258,7 +289,12 @@ def run(args: argparse.Namespace) -> int:
                     stop_event=stop_event,
                     timeout_sec=args.startup_timeout_sec,
                 )
-                _warm_up(sensors, cycles=args.warmup_cycles, stop_event=stop_event)
+                _warm_up(
+                    sensors,
+                    cycles=args.warmup_cycles,
+                    stop_event=stop_event,
+                    executor=sampler_pool,
+                )
                 next_deadline = time.monotonic()
                 continue
 
@@ -279,9 +315,19 @@ def run(args: argparse.Namespace) -> int:
             if now - report_started >= 5.0:
                 actual_fps = report_frames / (now - report_started)
                 pair_ms = (now - pair_started) * 1000.0
+                capture_ms = {
+                    side: (end_ns - start_ns) / 1_000_000.0
+                    for side, (start_ns, end_ns, _payload) in samples.items()
+                }
+                capture_mid_ns = {
+                    side: (start_ns + end_ns) // 2
+                    for side, (start_ns, end_ns, _payload) in samples.items()
+                }
+                lr_skew_ms = abs(capture_mid_ns["left"] - capture_mid_ns["right"]) / 1_000_000.0
                 print(
                     f"[SDK] frame={frame_idx} actual_fps={actual_fps:.2f} "
-                    f"last_pair_ms={pair_ms:.2f}",
+                    f"last_pair_ms={pair_ms:.2f} left_ms={capture_ms['left']:.2f} "
+                    f"right_ms={capture_ms['right']:.2f} lr_skew_ms={lr_skew_ms:.2f}",
                     flush=True,
                 )
                 report_started = now
@@ -300,6 +346,8 @@ def run(args: argparse.Namespace) -> int:
                 next_deadline = time.monotonic()
         return 0
     finally:
+        if sampler_pool is not None:
+            sampler_pool.shutdown(wait=True, cancel_futures=True)
         for side, sensor in reversed(tuple(sensors.items())):
             try:
                 sensor.disconnect()

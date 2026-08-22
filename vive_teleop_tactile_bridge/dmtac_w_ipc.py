@@ -80,6 +80,7 @@ def _make_specs() -> tuple[ModalitySpec, ...]:
 MODALITY_SPECS = _make_specs()
 MODALITY_BY_NAME = {spec.name: spec for spec in MODALITY_SPECS}
 PAYLOAD_BYTES = sum(spec.nbytes for spec in MODALITY_SPECS)
+PACKED_IMAGE_ENCODING = "8UC1"
 
 # magic, protocol version, header size, session id, seqlock sequence, software
 # frame index, capture start ns, capture end ns, packed payload size.
@@ -100,6 +101,41 @@ class FrameSnapshot:
     @property
     def capture_mid_ns(self) -> int:
         return (self.capture_start_ns + self.capture_end_ns) // 2
+
+
+def packed_layout_metadata() -> dict[str, int]:
+    """Return the fixed schema metadata stored with every recorded packed frame."""
+    layout: dict[str, int] = {
+        "schema_version": PROTOCOL_VERSION,
+        "byte_order_little_endian": 1,
+        "packed_frame_bytes": PAYLOAD_BYTES,
+    }
+    for spec in MODALITY_SPECS:
+        layout[f"{spec.name}_start"] = spec.offset
+        layout[f"{spec.name}_len"] = spec.nbytes
+        layout[f"{spec.name}_height"] = IMAGE_HEIGHT
+        layout[f"{spec.name}_width"] = IMAGE_WIDTH
+        layout[f"{spec.name}_channels"] = spec.channels
+        layout[f"{spec.name}_itemsize"] = spec.dtype.itemsize
+    return layout
+
+
+def capture_wall_ns_to_monotonic_sec(
+    capture_wall_ns: int,
+    *,
+    receive_wall_ns: int,
+    receive_monotonic_ns: int,
+) -> float:
+    """Map a same-host wall-clock capture timestamp into the monotonic domain.
+
+    The mapping is sampled at callback receipt.  It removes ROS/DDS delivery
+    delay while keeping the recorder grid, action events and robot-state
+    timestamps in one monotonic clock domain.
+    """
+    if capture_wall_ns <= 0 or receive_wall_ns <= 0 or receive_monotonic_ns <= 0:
+        raise ValueError("capture/receive timestamps must be positive")
+    transport_ns = receive_wall_ns - capture_wall_ns
+    return float(receive_monotonic_ns - transport_ns) * 1e-9
 
 
 def validate_protocol_constants() -> None:

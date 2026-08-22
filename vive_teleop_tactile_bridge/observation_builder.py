@@ -163,6 +163,8 @@ def tactile_row_fields(prefix: str, rec: dict[str, Any]) -> dict[str, Any]:
         f"{prefix}.sensor_index": int(rec["sensor_index"]),
         f"{prefix}.frame_idx": int(rec["frame_idx"]),
         f"{prefix}.capture_time": float(rec["capture_time"]),
+        f"{prefix}.capture_monotonic": float(rec.get("capture_monotonic", np.nan)),
+        f"{prefix}.transport_delay_sec": float(rec.get("transport_delay_sec", np.nan)),
         f"{prefix}.repeated": bool(rec["repeated"]),
         f"{prefix}.ros_stamp_sec": int(rec["ros_stamp_sec"]),
         f"{prefix}.ros_stamp_nanosec": int(rec["ros_stamp_nanosec"]),
@@ -210,7 +212,7 @@ def build_observation_frame(
     ok_tactile_right, dt_tactile_right, reason_tactile_right = valid_pair(
         "tactile_right", tactile_right_item, t_frame, thresholds.max_tactile_dt_sec
     )
-
+  
     enabled_val = None
     if enabled_item is not None:
         enabled_val = bool(enabled_item.payload.get("enabled", False))
@@ -310,4 +312,3 @@ def build_observation_frame(
         reason_tactile_right=reason_tactile_right,
     )
     return ObservationBuildResult(ok=True, reason="ok", frame=frame)
-

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""ROS 2 publisher for the Python-3.11 DM-Tac W SDK worker.
+"""ROS 2 packed-frame publisher for the Python-3.11 DM-Tac W SDK worker.
 
 The ROS process never imports ``dmrobotics``.  It starts the SDK worker with an
 explicit virtual-environment interpreter, reads fixed frames from /dev/shm, and
-publishes five sensor_msgs/Image topics for each side.
+publishes one packed sensor_msgs/Image per side. Legacy modality topics are
+optional and disabled by default.
 """
 from __future__ import annotations
 
@@ -25,6 +26,8 @@ from .dmtac_w_ipc import (
     IMAGE_HEIGHT,
     IMAGE_WIDTH,
     MODALITY_SPECS,
+    PACKED_IMAGE_ENCODING,
+    PAYLOAD_BYTES,
     FrameSnapshot,
     MMapFrameReader,
     payload_segment,
@@ -44,13 +47,14 @@ class DMTacWBridge(Node):
         self.declare_parameter("left_frame_path", "/dev/shm/dmtac_w_left.frame")
         self.declare_parameter("right_frame_path", "/dev/shm/dmtac_w_right.frame")
         self.declare_parameter("base_topic", "/dmtac")
-        self.declare_parameter("max_fps", 10.0)
-        self.declare_parameter("poll_hz", 100.0)
+        self.declare_parameter("max_fps", 30.0)
+        self.declare_parameter("poll_hz", 200.0)
         self.declare_parameter("startup_timeout_sec", 60.0)
         self.declare_parameter("frame_timeout_sec", 10.0)
         self.declare_parameter("warmup_cycles", 3)
         self.declare_parameter("show_sdk_fps", False)
-        self.declare_parameter("qos_depth", 2)
+        self.declare_parameter("qos_depth", 1)
+        self.declare_parameter("publish_legacy_modalities", False)
         self.declare_parameter("worker_shutdown_timeout_sec", 5.0)
 
         self._closing = False
@@ -87,24 +91,39 @@ class DMTacWBridge(Node):
         self.warmup_cycles = int(self.get_parameter("warmup_cycles").value)
         self.show_sdk_fps = bool(self.get_parameter("show_sdk_fps").value)
         self.qos_depth = int(self.get_parameter("qos_depth").value)
+        self.publish_legacy_modalities = bool(
+            self.get_parameter("publish_legacy_modalities").value
+        )
         self.worker_shutdown_timeout_sec = float(
             self.get_parameter("worker_shutdown_timeout_sec").value
         )
 
         self._validate_parameters()
 
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
+        packed_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=self.qos_depth,
         )
+        self._packed_publishers = {
+            side: self.create_publisher(
+                Image, f"{self.base_topic}/{side}/packed_frame", packed_qos
+            )
+            for side in ("left", "right")
+        }
         self._image_publishers: dict[str, dict[str, Any]] = {}
-        for side in ("left", "right"):
-            prefix = f"{self.base_topic}/{side}"
-            self._image_publishers[side] = {
-                spec.name: self.create_publisher(Image, f"{prefix}/{spec.name}", qos)
-                for spec in MODALITY_SPECS
-            }
+        if self.publish_legacy_modalities:
+            legacy_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=self.qos_depth,
+            )
+            for side in ("left", "right"):
+                prefix = f"{self.base_topic}/{side}"
+                self._image_publishers[side] = {
+                    spec.name: self.create_publisher(Image, f"{prefix}/{spec.name}", legacy_qos)
+                    for spec in MODALITY_SPECS
+                }
 
         self.readers = {
             side: MMapFrameReader(path, session_id=self.session_id)
@@ -131,7 +150,9 @@ class DMTacWBridge(Node):
         )
         self.get_logger().info(
             f"DM-Tac W bridge ready: left={self.serials['left']} "
-            f"right={self.serials['right']} target_fps={self.max_fps}"
+            f"right={self.serials['right']} target_fps={self.max_fps} "
+            f"packed_topics={self.base_topic}/<side>/packed_frame "
+            f"legacy_modalities={self.publish_legacy_modalities}"
         )
 
     def _validate_parameters(self) -> None:
@@ -239,17 +260,29 @@ class DMTacWBridge(Node):
     def _publish_snapshot(self, side: str, snapshot: FrameSnapshot) -> None:
         frame_id = f"{self.serials[side]}|fid={snapshot.frame_idx}"
         capture_ns = snapshot.capture_mid_ns
-        for spec in MODALITY_SPECS:
-            message = Image()
-            self._stamp_image(message, capture_ns)
-            message.header.frame_id = frame_id
-            message.height = IMAGE_HEIGHT
-            message.width = IMAGE_WIDTH
-            message.encoding = spec.encoding
-            message.is_bigendian = 0
-            message.step = spec.step
-            message.data = payload_segment(snapshot.payload, spec)
-            self._image_publishers[side][spec.name].publish(message)
+        packed = Image()
+        self._stamp_image(packed, capture_ns)
+        packed.header.frame_id = frame_id
+        packed.height = 1
+        packed.width = PAYLOAD_BYTES
+        packed.encoding = PACKED_IMAGE_ENCODING
+        packed.is_bigendian = 0
+        packed.step = PAYLOAD_BYTES
+        packed.data = snapshot.payload
+        self._packed_publishers[side].publish(packed)
+
+        if self.publish_legacy_modalities:
+            for spec in MODALITY_SPECS:
+                message = Image()
+                self._stamp_image(message, capture_ns)
+                message.header.frame_id = frame_id
+                message.height = IMAGE_HEIGHT
+                message.width = IMAGE_WIDTH
+                message.encoding = spec.encoding
+                message.is_bigendian = 0
+                message.step = spec.step
+                message.data = payload_segment(snapshot.payload, spec)
+                self._image_publishers[side][spec.name].publish(message)
 
     def _poll_shared_frames(self) -> None:
         if self._closing or self._background_error is not None:

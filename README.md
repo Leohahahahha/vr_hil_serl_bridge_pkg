@@ -66,6 +66,56 @@ or:
 ros2 launch vive_teleop_tactile_bridge full_stack.launch.py
 ```
 
+## DM-Tac W packed acquisition
+
+The legacy SDK worker targets 30 Hz and reads the left/right sensors
+concurrently. Getters within one physical sensor remain serial because SDK
+0.1.4 does not expose an atomic snapshot API.
+
+The bridge publishes one latest-only packed message per side:
+
+    /dmtac/left/packed_frame
+    /dmtac/right/packed_frame
+
+Each packed message is a fixed-schema sensor_msgs/Image (8UC1,
+1,920,000 bytes). Its header timestamp is the SDK getter-group capture
+midpoint. The raw recorder maps that timestamp into its monotonic clock domain
+before selecting the nearest tactile frame for the 10 Hz trajectory.
+
+The worker reports actual_fps, per-side capture time, pair time, and
+left/right capture skew every five seconds. A configured 30 Hz target is valid
+only when the reported capture/pair time remains below the 33.3 ms period.
+Set publish_legacy_modalities to true only when the five old modality topics
+are explicitly needed; doing so restores their serialization/callback load.
+
+## DM-Tac W to N0-VTLA canonical LeRobot
+
+The exporter decodes the lossless packed DM-Tac W zarr rows, maps
+`[shear_x, shear_y, depth]` to two 3-channel tactile videos, and writes the
+N0-VTLA single-arm canonical schema (`observation.state`, `action`, and
+`action_mask` are all 32-dimensional; dimensions `0:10` are active).
+
+Install the offline conversion dependencies in the Python environment used by
+the command: `numpy`, `pandas`, `pyarrow`, `zarr`, `Pillow`, and OpenCV.
+
+After rebuilding and sourcing the ROS 2 workspace, run:
+
+```bash
+ros2 run vive_teleop_tactile_bridge raw_dmtac_w_to_n0vtla_lerobot \
+  --raw-root /absolute/path/to/raw_dataset \
+  --out-root /absolute/path/to/lerobot_dataset
+```
+
+The default `--timing-policy strict` rejects missing fixed-FPS candidates and
+irregular timestamps instead of silently changing the trajectory time scale.
+`--timing-policy compact` is only for a format smoke test and must not be used
+to turn an irregular recording into training data.
+
+Keep `meta/tactile_encoding.json` with the converted dataset and apply the same
+channel order/scales during deployment. The first tactile frame of each
+episode must be a clear, no-contact baseline because N0-VTLA forms tactile
+inputs as `current - episode_frame_0`.
+
 ## Notes
 
 - `server_url` must point to the Ubuntu 20.04 machine running `franka_server.py`, not the FR3 controller box.

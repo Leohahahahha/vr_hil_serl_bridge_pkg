@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Record total HIL-SERL data with two legacy DM-Tac W SDK 0.1.4 sensors.
+"""Record HIL-SERL data with two legacy DM-Tac W SDK 0.1.4 sensors.
 
-The same-host bridge publishes raw image, deformation2d, normal, shear, and
-depth for each sensor. All five messages in one sequential SDK getter group
-share a ROS timestamp and software sample id. The legacy SDK does not expose a
-hardware frame id or an atomic snapshot API.
+The same-host bridge publishes one fixed-layout packed frame per sensor. The
+worker reads the two sensors concurrently while keeping each sensor's five SDK
+getters serial. The packed message carries the SDK capture midpoint; the
+recorder maps it into the monotonic clock domain before nearest-frame matching.
+The legacy SDK does not expose a hardware frame id or an atomic snapshot API.
 """
 from __future__ import annotations
 
 import argparse
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -24,6 +26,12 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, Float32, String
 
 try:
+    from .dmtac_w_ipc import (
+        PACKED_IMAGE_ENCODING,
+        PAYLOAD_BYTES,
+        capture_wall_ns_to_monotonic_sec,
+        packed_layout_metadata,
+    )
     from .raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter
     from .record_raw_hilserl_zed_tactile_paxini import (
         RawCollectionNode as CommonRawCollectionNode,
@@ -34,6 +42,12 @@ try:
         wait_for_topics_ready,
     )
 except ImportError:
+    from dmtac_w_ipc import (  # type: ignore
+        PACKED_IMAGE_ENCODING,
+        PAYLOAD_BYTES,
+        capture_wall_ns_to_monotonic_sec,
+        packed_layout_metadata,
+    )
     from raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter  # type: ignore
     from record_raw_hilserl_zed_tactile_paxini import (  # type: ignore
         RawCollectionNode as CommonRawCollectionNode,
@@ -47,7 +61,7 @@ except ImportError:
 
 DMTAC_SCHEMA_VERSION = 1
 DMTAC_IMAGE_SHAPE = (240, 320)
-DMTAC_PACKED_FRAME_BYTES = 1_920_000
+DMTAC_PACKED_FRAME_BYTES = PAYLOAD_BYTES
 
 
 @dataclass(frozen=True)
@@ -93,8 +107,8 @@ class RecordConfig:
     command_event_topic: str
     robot_state_topic: str
     tactile_msg_package: str
-    tactile_left_topics: dict[str, str]
-    tactile_right_topics: dict[str, str]
+    tactile_left_packed_topic: str
+    tactile_right_packed_topic: str
 
     max_image_dt_sec: float
     max_wrist_image_dt_sec: float
@@ -107,14 +121,11 @@ class RecordConfig:
     save_debug_jsonl: bool
 
 
-def _side_topics(tactile: dict[str, Any], side: str, base_topic: str) -> dict[str, str]:
+def _side_packed_topic(tactile: dict[str, Any], side: str, base_topic: str) -> str:
     side_cfg = tactile.get(side, {})
     if not isinstance(side_cfg, dict):
         raise ValueError(f"tactile.{side} must be a mapping")
-    return {
-        name: str(side_cfg.get(f"{name}_topic", f"{base_topic}/{side}/{name}"))
-        for name in DMTAC_FRAME_PARTS
-    }
+    return str(side_cfg.get("packed_topic", f"{base_topic}/{side}/packed_frame"))
 
 
 def load_config(path: str | Path) -> RecordConfig:
@@ -164,8 +175,8 @@ def load_config(path: str | Path) -> RecordConfig:
         command_event_topic=str(command.get("command_event_topic", "/hilserl/command_event_json")),
         robot_state_topic=str(robot_state.get("state_topic", "/hilserl/robot_state_json")),
         tactile_msg_package=tactile_msg_package,
-        tactile_left_topics=_side_topics(tactile, "left", base_topic),
-        tactile_right_topics=_side_topics(tactile, "right", base_topic),
+        tactile_left_packed_topic=_side_packed_topic(tactile, "left", base_topic),
+        tactile_right_packed_topic=_side_packed_topic(tactile, "right", base_topic),
         max_image_dt_sec=float(sync.get("max_image_dt_sec", 0.10)),
         max_wrist_image_dt_sec=float(sync.get("max_wrist_image_dt_sec", 0.10)),
         max_action_dt_sec=float(sync.get("max_action_dt_sec", 0.08)),
@@ -263,6 +274,66 @@ def _parse_frame_id(frame_id: str) -> tuple[str, int]:
     return sensor_id, sdk_fid
 
 
+def _packed_msg_to_payload(
+    msg: Image,
+    *,
+    side: str,
+    sensor_index: int,
+    receive_monotonic_ns: int,
+    receive_wall_ns: int,
+) -> tuple[float, dict[str, Any]]:
+    if int(msg.height) != 1 or int(msg.width) != DMTAC_PACKED_FRAME_BYTES:
+        raise ValueError(
+            f"{side} packed frame shape must be 1x{DMTAC_PACKED_FRAME_BYTES}, "
+            f"got {msg.height}x{msg.width}"
+        )
+    if str(msg.encoding) != PACKED_IMAGE_ENCODING or int(msg.step) != DMTAC_PACKED_FRAME_BYTES:
+        raise ValueError(
+            f"{side} packed frame encoding/step mismatch: "
+            f"encoding={msg.encoding!r}, step={msg.step}"
+        )
+    packed = np.frombuffer(msg.data, dtype=np.uint8).reshape(-1).copy()
+    if packed.size != DMTAC_PACKED_FRAME_BYTES:
+        raise ValueError(
+            f"{side} packed frame bytes={packed.size}, expected={DMTAC_PACKED_FRAME_BYTES}"
+        )
+    sensor_id, sdk_fid = _parse_frame_id(str(msg.header.frame_id))
+    capture_wall_ns = (
+        int(msg.header.stamp.sec) * 1_000_000_000
+        + int(msg.header.stamp.nanosec)
+    )
+    capture_monotonic = capture_wall_ns_to_monotonic_sec(
+        capture_wall_ns,
+        receive_wall_ns=receive_wall_ns,
+        receive_monotonic_ns=receive_monotonic_ns,
+    )
+    receive_monotonic = receive_monotonic_ns * 1e-9
+    capture_wall_sec = capture_wall_ns * 1e-9
+    payload = {
+        "msg_package": "dmtac_tactile",
+        "sensor_id": sensor_id,
+        "sensor_index": sensor_index,
+        "frame_idx": sdk_fid,
+        "capture_time": capture_wall_sec,
+        "capture_monotonic": capture_monotonic,
+        "transport_delay_sec": receive_monotonic - capture_monotonic,
+        "repeated": False,
+        "data": packed,
+        "data_len": int(packed.size),
+        "data_dtype": "uint8",
+        "source_dtype": (
+            "raw_image:uint8;deformation2d,normal,shear,depth:float32_le"
+        ),
+        "layout": packed_layout_metadata(),
+        "ros_stamp_sec": int(msg.header.stamp.sec),
+        "ros_stamp_nanosec": int(msg.header.stamp.nanosec),
+        "ros_stamp_float": capture_wall_sec,
+        "frame_id": str(msg.header.frame_id),
+        "recv_time": receive_monotonic,
+    }
+    return capture_monotonic, payload
+
+
 class DMTacFrameAssembler:
     def __init__(self, side: str, sensor_index: int) -> None:
         self.side = side
@@ -339,12 +410,8 @@ class RawCollectionNode(CommonRawCollectionNode):
         self.vr_pose_buffer = TimedBuffer(maxlen=2048)
         self.enabled_buffer = TimedBuffer(maxlen=2048)
         self.joystick_y_buffer = TimedBuffer(maxlen=2048)
-        self.tactile_left_buffer = TimedBuffer(maxlen=16)
-        self.tactile_right_buffer = TimedBuffer(maxlen=16)
-        self._assemblers = {
-            "left": DMTacFrameAssembler("left", 0),
-            "right": DMTacFrameAssembler("right", 1),
-        }
+        self.tactile_left_buffer = TimedBuffer(maxlen=256)
+        self.tactile_right_buffer = TimedBuffer(maxlen=256)
 
         image_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -356,10 +423,10 @@ class RawCollectionNode(CommonRawCollectionNode):
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
-        tactile_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
+        packed_tactile_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=5,
+            depth=1,
         )
         log_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -378,31 +445,35 @@ class RawCollectionNode(CommonRawCollectionNode):
         self.create_subscription(Bool, cfg.enabled_topic, self._enabled_cb, fast_qos)
         self.create_subscription(Float32, cfg.joystick_y_topic, self._joystick_y_cb, fast_qos)
 
-        for side, topics in (
-            ("left", cfg.tactile_left_topics),
-            ("right", cfg.tactile_right_topics),
+        for side, topic, sensor_index in (
+            ("left", cfg.tactile_left_packed_topic, 0),
+            ("right", cfg.tactile_right_packed_topic, 1),
         ):
-            for modality, topic in topics.items():
-                self.create_subscription(
-                    Image,
-                    topic,
-                    lambda msg, s=side, m=modality: self._dmtac_cb(s, m, msg),
-                    tactile_qos,
-                )
-                self.get_logger().info(f"subscribe DM-Tac {side} {modality}: {topic}")
+            self.create_subscription(
+                Image,
+                topic,
+                lambda msg, s=side, i=sensor_index: self._dmtac_packed_cb(s, i, msg),
+                packed_tactile_qos,
+            )
+            self.get_logger().info(f"subscribe DM-Tac {side} packed frame: {topic}")
 
-    def _dmtac_cb(self, side: str, modality: str, msg: Any) -> None:
-        recv_time = now_monotonic()
+    def _dmtac_packed_cb(self, side: str, sensor_index: int, msg: Image) -> None:
+        receive_monotonic_ns = time.monotonic_ns()
+        receive_wall_ns = time.time_ns()
         try:
-            payload = self._assemblers[side].add(modality, msg, recv_time)
+            capture_monotonic, payload = _packed_msg_to_payload(
+                msg,
+                side=side,
+                sensor_index=sensor_index,
+                receive_monotonic_ns=receive_monotonic_ns,
+                receive_wall_ns=receive_wall_ns,
+            )
         except Exception as exc:
-            self.get_logger().error(f"invalid DM-Tac {side} {modality} frame: {exc!r}")
-            return
-        if payload is None:
+            self.get_logger().error(f"invalid DM-Tac {side} packed frame: {exc!r}")
             return
         with self._lock:
             target = self.tactile_left_buffer if side == "left" else self.tactile_right_buffer
-            target.append(recv_time, payload)
+            target.append(capture_monotonic, payload)
 
 
 def main() -> None:

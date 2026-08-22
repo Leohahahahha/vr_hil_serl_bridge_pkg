@@ -416,6 +416,8 @@ class RawDatasetWriter:
             "sensor_index": int(payload["sensor_index"]),
             "frame_idx": int(payload["frame_idx"]),
             "capture_time": float(payload["capture_time"]),
+            "capture_monotonic": float(payload.get("capture_monotonic", np.nan)),
+            "transport_delay_sec": float(payload.get("transport_delay_sec", np.nan)),
             "repeated": bool(payload["repeated"]),
             "ros_stamp_sec": int(payload["ros_stamp_sec"]),
             "ros_stamp_nanosec": int(payload["ros_stamp_nanosec"]),

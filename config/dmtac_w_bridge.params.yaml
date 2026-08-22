@@ -14,8 +14,11 @@ dmtac_w_bridge:
     right_frame_path: "/dev/shm/dmtac_w_right.frame"
 
     base_topic: "/dmtac"
-    max_fps: 10.0
-    poll_hz: 100.0
+    # Worker target rate. The actual rate is reported every five seconds as
+    # actual_fps/left_ms/right_ms/lr_skew_ms and may be lower if SDK getters
+    # cannot finish within 33.3 ms per side.
+    max_fps: 30.0
+    poll_hz: 200.0
 
     # Sensor() automatically resets. Both surfaces must remain unloaded until
     # both statuses become OK, after which warmup frames are discarded.
@@ -24,5 +27,7 @@ dmtac_w_bridge:
     frame_timeout_sec: 10.0
     show_sdk_fps: false
 
-    qos_depth: 2
+    # Latest-only packed transport avoids a reliable queue of 1.92 MB frames.
+    qos_depth: 1
+    publish_legacy_modalities: false
     worker_shutdown_timeout_sec: 5.0
