@@ -1,0 +1,154 @@
+tactile_vr_tracker_node:
+  ros__parameters:
+    update_rate: 90.0
+    publish_tf: true
+    frame_id: vr_room
+    hmd_frame_id: vr_hmd_ros
+    enable_right_controller: true
+    haptic_on_trigger: true
+    haptic_duration_us: 3000
+    reinit_interval: 5.0
+
+tactile_vr_converter_node:
+  ros__parameters:
+    server_url: "http://172.31.179.19:5000"
+    request_timeout_sec: 2.0
+    publish_rate: 90.0
+
+    enable_robot_commands: true
+
+    input_pose_topic: /vr/right_controller/pose_hmd
+
+    trigger_enable_threshold: 0.60
+    trigger_disable_threshold: 0.40
+    trigger_toggle_threshold: 0.75
+    gripper_control_mode: joystick_width
+    gripper_width_command_topic: /hilserl/gripper_width_cmd
+    gripper_width_min: 0.0
+    gripper_width_max: 0.085
+    gripper_initial_width: 0.085
+    joystick_gripper_deadzone: 0.15
+    joystick_gripper_width_rate: 0.04
+    joystick_gripper_send_hz: 20.0
+    joystick_gripper_invert: false
+
+    # Incremental integration gains (not Twist velocities)
+    delta_linear_gain_xy: 1.00
+    delta_linear_gain_z: 1.15
+    delta_angular_gain: 0.45
+    enable_rotation: true
+    pose_lowpass_alpha: 0.35
+    translation_deadzone: 0.002
+    rotation_deadzone: 0.02
+
+    speed_scale_fast: 1.0
+    speed_scale_slow: 0.35
+    speed_mode_transition_time: 0.25
+
+    planning_frame: fr3_link0
+
+    # 3x3 row-major rotation matrix that maps VR command axes to robot-base intuition
+    vr_to_robot_rotation: [
+      1.0, 0.0, 0.0,
+      0.0, 1.0, 0.0,
+      0.0, 0.0, 1.0
+    ]
+
+    workspace_min: [0.30, -0.30, 0.08]
+    workspace_max: [0.75, 0.40, 0.60]
+
+    joystick_gripper_use_move_endpoint: false
+    joystick_gripper_step: 18
+
+    activate_gripper_on_start: false
+    clear_error_on_start: false
+    a_button_reanchor: true
+    a_button_joint_reset: false
+
+    debug_target_topic: /vr_bridge/target_pose
+    debug_enabled_topic: /vr_bridge/enabled
+    debug_speed_topic: /vr_bridge/speed_scale
+
+    # Raw data collection logging topics.
+    # These are published by the same node that sends HTTP /pose, so they are
+    # the authoritative action labels for recorder / training.
+    sent_action_topic: /hilserl/sent_action8
+    command_event_topic: /hilserl/command_event_json
+    http_status_topic: /hilserl/http_status_json
+    robot_state_topic: /hilserl/robot_state_json
+    enable_command_logging: true
+    enable_state_poll: true
+    state_poll_hz: 30.0
+    state_poll_timeout_sec: 0.12
+
+    publish_gripper_tcp_tf: false
+    gripper_parent_frame: robotiq_85_base_link
+    gripper_child_frame: robotiq_85_tcp
+    gripper_tcp_xyz: [0.0, 0.0, 0.0]
+    gripper_tcp_rpy: [0.0, 0.0, 0.0]
+
+tactile_franka_http_bridge:
+  ros__parameters:
+    server_url: "http://172.31.179.19:5000"
+    request_timeout_sec: 0.12
+    publish_rate: 90.0
+
+    enable_robot_commands: true
+
+    input_pose_topic: /vr/right_controller/pose_hmd
+
+    trigger_enable_threshold: 0.60
+    trigger_disable_threshold: 0.40
+    trigger_toggle_threshold: 0.75
+    gripper_control_mode: joystick_width
+    gripper_width_command_topic: /hilserl/gripper_width_cmd
+    gripper_width_min: 0.0
+    gripper_width_max: 0.085
+    gripper_initial_width: 0.085
+    joystick_gripper_deadzone: 0.15
+    joystick_gripper_width_rate: 0.04
+    joystick_gripper_send_hz: 20.0
+    joystick_gripper_invert: false
+
+    delta_linear_gain_xy: 0.20
+    delta_linear_gain_z: 0.10
+    delta_angular_gain: 0.15
+    enable_rotation: false
+    pose_lowpass_alpha: 0.25
+    translation_deadzone: 0.002
+    rotation_deadzone: 0.02
+
+    speed_scale_fast: 1.0
+    speed_scale_slow: 0.35
+    speed_mode_transition_time: 0.25
+
+    planning_frame: fr3_link0
+    vr_to_robot_rotation: [
+      1.0, 0.0, 0.0,
+      0.0, 1.0, 0.0,
+      0.0, 0.0, 1.0
+    ]
+
+    workspace_min: [0.30, -0.30, 0.08]
+    workspace_max: [0.75, 0.30, 0.45]
+
+    joystick_gripper_use_move_endpoint: false
+    joystick_gripper_step: 18
+
+    activate_gripper_on_start: false
+    clear_error_on_start: false
+    a_button_reanchor: false
+    a_button_joint_reset: true
+
+    debug_target_topic: /vr_bridge/target_pose
+    debug_enabled_topic: /vr_bridge/enabled
+    debug_speed_topic: /vr_bridge/speed_scale
+
+    sent_action_topic: /hilserl/sent_action8
+    command_event_topic: /hilserl/command_event_json
+    http_status_topic: /hilserl/http_status_json
+    robot_state_topic: /hilserl/robot_state_json
+    enable_command_logging: true
+    enable_state_poll: true
+    state_poll_hz: 30.0
+    state_poll_timeout_sec: 0.12

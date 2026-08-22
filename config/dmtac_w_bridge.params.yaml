@@ -1,0 +1,28 @@
+dmtac_w_bridge:
+  ros__parameters:
+    # Explicit Python 3.11 SDK environment. Do not activate it in the ROS shell.
+    sdk_python: "/home/enine/data_collect/vive_teleop_tactile/tactile/Daimon/venv_x86_py311/bin/python"
+
+    # Empty means: use the worker installed in this ROS package's share/scripts.
+    worker_script: ""
+
+    left_serial: "M2505150082"
+    right_serial: "M2505150198"
+
+    # Runtime-owned fixed mmap files; each retains only the newest 1.92 MB frame.
+    left_frame_path: "/dev/shm/dmtac_w_left.frame"
+    right_frame_path: "/dev/shm/dmtac_w_right.frame"
+
+    base_topic: "/dmtac"
+    max_fps: 10.0
+    poll_hz: 100.0
+
+    # Sensor() automatically resets. Both surfaces must remain unloaded until
+    # both statuses become OK, after which warmup frames are discarded.
+    startup_timeout_sec: 60.0
+    warmup_cycles: 3
+    frame_timeout_sec: 10.0
+    show_sdk_fps: false
+
+    qos_depth: 2
+    worker_shutdown_timeout_sec: 5.0

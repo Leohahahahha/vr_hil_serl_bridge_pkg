@@ -1,0 +1,67 @@
+# Raw dataset collection config for FR3 + ZED2i + HIL-SERL franka_server.
+# Run on the ROS2 / perception machine.
+
+dataset:
+  root: "/home/enine/.cache/huggingface/lerobot/fr3_zed_raw_v02"
+
+record:
+  fps: 10.0
+  num_episodes: 30
+  max_episode_sec: 300.0
+  task_description: "fr3 zed raw teleop via hilserl franka_server"
+  task_index: 0
+  wait_for_motion_enable_to_record: true
+  debug: true
+
+server:
+  # Robot-control PC IP + franka_server Flask port.
+  url: "http://172.31.179.19:5000"
+  http_timeout_sec: 0.08
+  control_hz: 10.0
+  state_poll_hz: 30.0
+
+vr:
+  target_pose_topic: "/vr_bridge/target_pose"
+  enabled_topic: "/vr_bridge/enabled"
+  trigger_topic: "/vr/right_controller/trigger"
+  trigger_toggle_threshold: 0.75
+
+# Topics published by tactile_franka_http_bridge.
+command:
+  sent_action_topic: "/hilserl/sent_action8"
+  command_event_topic: "/hilserl/command_event_json"
+  http_status_topic: "/hilserl/http_status_json"
+
+robot_state:
+  state_topic: "/hilserl/robot_state_json"
+
+point_cloud:
+  topic: "/zed/zed_node/point_cloud/cloud_registered"
+  name: "front"
+  save_raw: true
+  # 0 means save all valid xyz points. For fast dry-runs, set e.g. 20000.
+  max_points: 0
+  save_rgb: true
+  compress: false
+
+sync:
+  # Fixed-FPS LeRobot-style sampling. Each frame chooses nearest sensor/action/state by monotonic time.
+  max_cloud_dt_sec: 0.10
+  max_action_dt_sec: 0.08
+  max_state_dt_sec: 0.08
+  max_vr_dt_sec: 0.10
+  use_monotonic_time: true
+
+safety:
+  # Optional workspace clipping before POST /pose. Set enabled=false if you already clip elsewhere.
+  clip_workspace: false
+  x_min: 0.25
+  x_max: 0.85
+  y_min: -0.45
+  y_max: 0.45
+  z_min: 0.02
+  z_max: 0.65
+
+output:
+  save_master_parquet_every_episode: true
+  save_debug_jsonl: true

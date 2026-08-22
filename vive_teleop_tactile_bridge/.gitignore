@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# ROS 2 / colcon
+build/
+install/
+log/
+
+# IDE
+.vscode/
+.idea/
+
+# 临时文件
+*.tmp
+*.log
+
+# 采集数据，不放入 Git
+*.bag
+*.db3
+*.mcap
+*.zarr/
+raw_data/
+datasets/
