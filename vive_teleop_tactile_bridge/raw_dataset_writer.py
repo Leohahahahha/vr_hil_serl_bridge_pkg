@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import queue
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -38,6 +40,24 @@ class RawDatasetWriterConfig(Protocol):
 class RawDatasetWriterProfile:
     tactile_feature_description: str
     stream_tactile: bool = False
+
+
+@dataclass
+class _FrameWriteTask:
+    image_msg: Image
+    image_out_path: Path
+    wrist_image_msg: Image
+    wrist_image_out_path: Path
+    left_record: dict[str, Any]
+    right_record: dict[str, Any]
+
+
+@dataclass
+class _FlushWriteTask:
+    completed: threading.Event
+
+
+_STOP_WRITER = object()
 
 
 TASHAN_RAW_WRITER_PROFILE = RawDatasetWriterProfile(
@@ -121,6 +141,15 @@ class RawDatasetWriter:
         self.current_tactile_left_start: Optional[int] = None
         self.current_tactile_right_start: Optional[int] = None
 
+        self._async_frame_writes = bool(profile.stream_tactile)
+        queue_size = max(4, int(getattr(cfg, "write_queue_size", 48)))
+        self._tactile_batch_frames = max(
+            1, int(getattr(cfg, "tactile_batch_frames", 8))
+        )
+        self._write_queue: queue.Queue[object] = queue.Queue(maxsize=queue_size)
+        self._writer_thread: Optional[threading.Thread] = None
+        self._writer_error: Optional[BaseException] = None
+
     def prepare(self) -> None:
         try:
             import zarr  # noqa: F401
@@ -177,6 +206,8 @@ class RawDatasetWriter:
                 ),
                 "action.pose7": "float32[7], raw absolute target/held pose used by the robot command event",
                 "action.command_type": "string, command_event_json type; currently robot_command",
+                "action.heartbeat": "bool, true when the label repeats the last successful held command",
+                "action.repeated": "bool, true when no new HTTP command was sent for this event",
                 "action.pose_commanded": "bool, true when this command event sent an HTTP /pose target",
                 "action.gripper_commanded": "bool, true when this command event sent a gripper command",
                 "action.motion_enabled": "bool, /vr_bridge/enabled value captured by the command event",
@@ -194,8 +225,143 @@ class RawDatasetWriter:
         }
         with open(self.info_path, "w", encoding="utf-8") as f:
             json.dump(info, f, ensure_ascii=False, indent=2)
+        if self._async_frame_writes:
+            self._start_background_writer()
+
+    def _start_background_writer(self) -> None:
+        if self._writer_thread is not None:
+            return
+        self._writer_thread = threading.Thread(
+            target=self._background_writer_loop,
+            name="raw-dataset-writer",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
+    def _raise_writer_error(self) -> None:
+        if self._writer_error is not None:
+            raise RuntimeError("background dataset writer failed") from self._writer_error
+
+    def _enqueue_write(self, task: object) -> None:
+        self._raise_writer_error()
+        while True:
+            try:
+                self._write_queue.put(task, timeout=0.1)
+                return
+            except queue.Full:
+                self._raise_writer_error()
+
+    def _background_writer_loop(self) -> None:
+        tactile_batch: list[_FrameWriteTask] = []
+        while True:
+            task = self._write_queue.get()
+            try:
+                if self._writer_error is not None:
+                    if isinstance(task, _FlushWriteTask):
+                        task.completed.set()
+                    if task is _STOP_WRITER:
+                        return
+                    continue
+                if task is _STOP_WRITER:
+                    self._flush_tactile_task_batch(tactile_batch)
+                    return
+                if isinstance(task, _FlushWriteTask):
+                    self._flush_tactile_task_batch(tactile_batch)
+                    task.completed.set()
+                    continue
+                if not isinstance(task, _FrameWriteTask):
+                    raise TypeError(f"unsupported writer task: {type(task)!r}")
+
+                self._write_png(task.image_msg, task.image_out_path)
+                self._write_png(task.wrist_image_msg, task.wrist_image_out_path)
+                tactile_batch.append(task)
+                if len(tactile_batch) >= self._tactile_batch_frames:
+                    self._flush_tactile_task_batch(tactile_batch)
+            except BaseException as exc:
+                self._writer_error = exc
+                if isinstance(task, _FlushWriteTask):
+                    task.completed.set()
+            finally:
+                self._write_queue.task_done()
+
+    @staticmethod
+    def _write_png(msg: Image, out_path: Path) -> None:
+        rgb = image_msg_to_rgb8(msg)
+        try:
+            PILImage.fromarray(rgb, mode="RGB").save(str(out_path))
+        except Exception as exc:
+            raise RuntimeError(f"failed to write PNG: {out_path}") from exc
+
+    def _flush_tactile_task_batch(self, tasks: list[_FrameWriteTask]) -> None:
+        if not tasks:
+            return
+        left_records = [task.left_record for task in tasks]
+        right_records = [task.right_record for task in tasks]
+        left_start = self._tactile_zarr_row_count(self.tactile_left_zarr_path)
+        right_start = self._tactile_zarr_row_count(self.tactile_right_zarr_path)
+        success = False
+        try:
+            self._append_tactile_records_to_zarr(
+                records=left_records,
+                zarr_path=self.tactile_left_zarr_path,
+                meta_path=self.tactile_left_meta_path,
+                write_metadata=False,
+            )
+            self._append_tactile_records_to_zarr(
+                records=right_records,
+                zarr_path=self.tactile_right_zarr_path,
+                meta_path=self.tactile_right_meta_path,
+                write_metadata=False,
+            )
+            success = True
+        except BaseException:
+            self._truncate_tactile_zarr(self.tactile_left_zarr_path, left_start)
+            self._truncate_tactile_zarr(self.tactile_right_zarr_path, right_start)
+            raise
+        finally:
+            if success:
+                for record in left_records + right_records:
+                    record.pop("data", None)
+            tasks.clear()
+
+    def pending_write_tasks(self) -> int:
+        return int(self._write_queue.qsize()) if self._async_frame_writes else 0
+
+    def flush_pending_writes(self) -> None:
+        if not self._async_frame_writes:
+            return
+        completed = threading.Event()
+        barrier = _FlushWriteTask(completed=completed)
+        while True:
+            try:
+                self._write_queue.put(barrier, timeout=0.1)
+                break
+            except queue.Full:
+                continue
+        while not completed.wait(timeout=0.1):
+            if self._writer_thread is not None and not self._writer_thread.is_alive():
+                raise RuntimeError("background dataset writer stopped before flush")
+        self._raise_writer_error()
+
+    def close(self) -> None:
+        if self._writer_thread is None:
+            return
+        flush_error: Optional[BaseException] = None
+        try:
+            self.flush_pending_writes()
+        except BaseException as exc:
+            flush_error = exc
+        self._write_queue.put(_STOP_WRITER)
+        self._writer_thread.join(timeout=10.0)
+        if self._writer_thread.is_alive():
+            raise TimeoutError("background dataset writer did not stop")
+        self._writer_thread = None
+        if flush_error is not None:
+            raise RuntimeError("failed to flush background dataset writer") from flush_error
+        self._raise_writer_error()
 
     def start_episode(self, episode_index: int) -> None:
+        self.flush_pending_writes()
         self.current_episode_rows = []
         self.current_image_records = []
         self.current_wrist_image_records = []
@@ -216,6 +382,7 @@ class RawDatasetWriter:
         self.current_tmp_wrist_image_dir = wrist_tmp
 
     def discard_episode(self) -> None:
+        self.flush_pending_writes()
         if self.profile.stream_tactile:
             self._truncate_tactile_zarr(self.tactile_left_zarr_path, self.current_tactile_left_start)
             self._truncate_tactile_zarr(self.tactile_right_zarr_path, self.current_tactile_right_start)
@@ -265,27 +432,18 @@ class RawDatasetWriter:
     def _final_wrist_image_rel_path(self, episode_index: int, frame_index: int) -> Path:
         return Path("image") / self.cfg.wrist_image_name / f"episode_{episode_index:06d}" / f"frame_{frame_index:06d}.png"
 
-    def _save_image_to_dir(
+    def _make_image_record(
         self,
         *,
         episode_index: int,
         frame_index: int,
         msg: Image,
-        tmp_dir: Path,
+        out_path: Path,
         rel_path: Path,
         topic: str,
-        records: list[dict[str, Any]],
-    ) -> tuple[str, dict[str, Any]]:
-        rgb = image_msg_to_rgb8(msg)
-        out_path = tmp_dir / f"frame_{frame_index:06d}.png"
-        try:
-            PILImage.fromarray(rgb, mode="RGB").save(str(out_path))
-        except Exception as e:
-            raise RuntimeError(f"failed to write PNG: {out_path}") from e
-
+    ) -> dict[str, Any]:
         stamp = msg.header.stamp
-        frame_id = str(msg.header.frame_id)
-        rec = {
+        return {
             "episode_index": int(episode_index),
             "record_frame_index": int(frame_index),
             "path": str(rel_path),
@@ -298,9 +456,31 @@ class RawDatasetWriter:
             "ros_stamp_sec": int(stamp.sec),
             "ros_stamp_nanosec": int(stamp.nanosec),
             "ros_stamp_float": ros_stamp_to_float_sec(stamp),
-            "frame_id": frame_id,
+            "frame_id": str(msg.header.frame_id),
             "topic": topic,
         }
+
+    def _save_image_to_dir(
+        self,
+        *,
+        episode_index: int,
+        frame_index: int,
+        msg: Image,
+        tmp_dir: Path,
+        rel_path: Path,
+        topic: str,
+        records: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        out_path = tmp_dir / f"frame_{frame_index:06d}.png"
+        self._write_png(msg, out_path)
+        rec = self._make_image_record(
+            episode_index=episode_index,
+            frame_index=frame_index,
+            msg=msg,
+            out_path=out_path,
+            rel_path=rel_path,
+            topic=topic,
+        )
         records.append(rec)
         return str(rel_path), rec
 
@@ -393,6 +573,112 @@ class RawDatasetWriter:
         self.current_tactile_left_records.append(left_rec)
         self.current_tactile_right_records.append(right_rec)
         return left_rec, right_rec
+
+    def write_frame_assets(
+        self,
+        *,
+        episode_index: int,
+        frame_index: int,
+        timestamp: float,
+        wall_time: float,
+        image_msg: Image,
+        wrist_image_msg: Image,
+        left_payload: dict[str, Any],
+        left_dt: float,
+        right_payload: dict[str, Any],
+        right_dt: float,
+    ) -> tuple[str, dict[str, Any], str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Schedule all large assets for one aligned frame as one ordered task."""
+        if not self._async_frame_writes:
+            image_rel_path, image_rec = self.save_image(
+                episode_index, frame_index, image_msg
+            )
+            wrist_rel_path, wrist_rec = self.save_wrist_image(
+                episode_index, frame_index, wrist_image_msg
+            )
+            left_rec, right_rec = self.append_tactile_pair(
+                episode_index=episode_index,
+                frame_index=frame_index,
+                timestamp=timestamp,
+                wall_time=wall_time,
+                left_payload=left_payload,
+                left_dt=left_dt,
+                right_payload=right_payload,
+                right_dt=right_dt,
+            )
+            return (
+                image_rel_path,
+                image_rec,
+                wrist_rel_path,
+                wrist_rec,
+                left_rec,
+                right_rec,
+            )
+
+        if self.current_tmp_image_dir is None or self.current_tmp_wrist_image_dir is None:
+            raise RuntimeError("start_episode must be called before write_frame_assets")
+
+        image_rel = self._final_image_rel_path(episode_index, frame_index)
+        wrist_rel = self._final_wrist_image_rel_path(episode_index, frame_index)
+        image_out = self.current_tmp_image_dir / f"frame_{frame_index:06d}.png"
+        wrist_out = self.current_tmp_wrist_image_dir / f"frame_{frame_index:06d}.png"
+        image_rec = self._make_image_record(
+            episode_index=episode_index,
+            frame_index=frame_index,
+            msg=image_msg,
+            out_path=image_out,
+            rel_path=image_rel,
+            topic=self.cfg.image_topic,
+        )
+        wrist_rec = self._make_image_record(
+            episode_index=episode_index,
+            frame_index=frame_index,
+            msg=wrist_image_msg,
+            out_path=wrist_out,
+            rel_path=wrist_rel,
+            topic=self.cfg.wrist_image_topic,
+        )
+        left_rec = self._make_tactile_record(
+            episode_index=episode_index,
+            frame_index=frame_index,
+            timestamp=timestamp,
+            wall_time=wall_time,
+            payload=left_payload,
+            sync_dt=left_dt,
+            zarr_path=Path("tactile") / "tactile_left" / "data.zarr",
+        )
+        right_rec = self._make_tactile_record(
+            episode_index=episode_index,
+            frame_index=frame_index,
+            timestamp=timestamp,
+            wall_time=wall_time,
+            payload=right_payload,
+            sync_dt=right_dt,
+            zarr_path=Path("tactile") / "tactile_right" / "data.zarr",
+        )
+
+        self._enqueue_write(
+            _FrameWriteTask(
+                image_msg=image_msg,
+                image_out_path=image_out,
+                wrist_image_msg=wrist_image_msg,
+                wrist_image_out_path=wrist_out,
+                left_record=left_rec,
+                right_record=right_rec,
+            )
+        )
+        self.current_image_records.append(image_rec)
+        self.current_wrist_image_records.append(wrist_rec)
+        self.current_tactile_left_records.append(left_rec)
+        self.current_tactile_right_records.append(right_rec)
+        return (
+            str(image_rel),
+            image_rec,
+            str(wrist_rel),
+            wrist_rec,
+            left_rec,
+            right_rec,
+        )
 
     def _make_tactile_record(
         self,
@@ -491,6 +777,7 @@ class RawDatasetWriter:
                 f.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
     def commit_episode(self, episode_index: int) -> None:
+        self.flush_pending_writes()
         if self.current_tmp_image_dir is None or self.current_tmp_wrist_image_dir is None:
             return
         if not self.current_episode_rows:
@@ -587,6 +874,7 @@ class RawDatasetWriter:
         self.current_tactile_right_start = None
 
     def flush_master(self) -> None:
+        self.flush_pending_writes()
         if not self.rows:
             print("[WARN] no committed rows to write master parquet")
             return

@@ -71,8 +71,19 @@ sync:
   max_state_dt_sec: 0.08
   max_vr_dt_sec: 0.10
   max_tactile_dt_sec: 0.15
+  # Keep the 10 Hz candidate grid unchanged, but wait for slightly delayed
+  # camera/action messages before choosing the nearest sample.
+  sync_lag_sec: 0.25
+  # ZED and D405 header stamps are wall-clock capture times on this host; map
+  # them into the recorder's monotonic domain instead of using callback time.
+  use_image_header_stamp: true
   use_monotonic_time: true
 
 output:
   save_master_parquet_every_episode: true
   save_debug_jsonl: true
+  # One task contains both PNGs and both tactile sides. The bounded queue gives
+  # explicit backpressure instead of silently growing memory without limit.
+  write_queue_size: 48
+  # Resize/write both zarr arrays once per batch, not once per frame and side.
+  tactile_batch_frames: 8

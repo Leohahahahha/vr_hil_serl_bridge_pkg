@@ -165,6 +165,7 @@ class BridgeParams:
     http_status_topic: str = '/hilserl/http_status_json'
     robot_state_topic: str = '/hilserl/robot_state_json'
     enable_command_logging: bool = True
+    action_heartbeat_hz: float = 20.0
     enable_state_poll: bool = True
     state_poll_hz: float = 30.0
     state_poll_timeout_sec: float = 0.12
@@ -255,6 +256,8 @@ class FrankaHttpBridgeNode(Node):
         self.cmd_r: Optional[R] = None
         self.current_pose_cmd: Optional[np.ndarray] = None
         self.last_robot_pose7: Optional[np.ndarray] = None
+        self._last_effective_action8: Optional[np.ndarray] = None
+        self._last_action_event_publish_time: float = 0.0
 
         self.speed_scale: float = float(self.params.speed_scale_fast)
         self.speed_scale_target: float = float(self.params.speed_scale_fast)
@@ -599,6 +602,8 @@ class FrankaHttpBridgeNode(Node):
         event = {
             "type": "robot_command",
             "command_type": "robot_command",
+            "heartbeat": False,
+            "repeated": False,
             "pose_commanded": bool(pose_commanded),
             "gripper_commanded": bool(gripper_commanded),
             "t_event": float(t_send_start),
@@ -632,6 +637,74 @@ class FrankaHttpBridgeNode(Node):
         }
         self._publish_json(self.command_event_pub, event)
         self._publish_json(self.http_status_pub, event["http"])
+        if http_ok:
+            self._last_action_event_publish_time = float(t_send_start)
+            self._last_effective_action8 = action8.astype(np.float32, copy=True)
+
+    def _maybe_publish_action_heartbeat(self) -> None:
+        """Republish the last successfully applied command on a stable clock.
+
+        HTTP command events are irregular by nature: disabling motion, a quiet
+        controller, or one slow request can leave the recorder without a nearby
+        action label.  The heartbeat does not send another HTTP request.  It
+        only states that the last successful target remains the held command.
+        """
+        if not self.params.enable_command_logging:
+            return
+        heartbeat_hz = float(self.params.action_heartbeat_hz)
+        if heartbeat_hz <= 0.0 or self._last_effective_action8 is None:
+            return
+
+        now = time.monotonic()
+        if now - self._last_action_event_publish_time < 1.0 / heartbeat_hz:
+            return
+
+        action8 = self._last_effective_action8.astype(np.float32, copy=True)
+        pose7 = normalize_pose7(action8[:7])
+        action8[:7] = pose7.astype(np.float32)
+
+        arr_msg = Float32MultiArray()
+        arr_msg.data = action8.tolist()
+        self.sent_action_pub.publish(arr_msg)
+
+        event = {
+            "type": "robot_command_heartbeat",
+            "command_type": "robot_command_heartbeat",
+            "heartbeat": True,
+            "repeated": True,
+            "pose_commanded": False,
+            "gripper_commanded": False,
+            "t_event": float(now),
+            "wall_time": float(time.time()),
+            "action8": action8.astype(float).tolist(),
+            "pose7": pose7.astype(float).tolist(),
+            "target_gripper": float(action8[7]),
+            "target_gripper_width": float(self.gripper_width),
+            "gripper_control_mode": self.params.gripper_control_mode,
+            "enabled": bool(self.enabled),
+            "gripper_closed": bool(self.gripper_closed),
+            "workspace_min": np.asarray(self.workspace_min, dtype=float).tolist(),
+            "workspace_max": np.asarray(self.workspace_max, dtype=float).tolist(),
+            "workspace_clipped": bool(
+                np.any(pose7[:3] <= self.workspace_min + 1e-8)
+                or np.any(pose7[:3] >= self.workspace_max - 1e-8)
+            ),
+            "http": {
+                "route": "hold",
+                "ok": True,
+                "error": "",
+                "t_send_start": float(now),
+                "t_send_end": float(now),
+                "latency_ms": 0.0,
+            },
+            "source": {
+                "node": self.get_name(),
+                "input_pose_topic": self.params.input_pose_topic,
+                "planning_frame": self.params.planning_frame,
+            },
+        }
+        self._publish_json(self.command_event_pub, event)
+        self._last_action_event_publish_time = now
 
     def _state_poll_loop(self) -> None:
         """Poll franka_server /getstate in a background thread.
@@ -715,6 +788,7 @@ class FrankaHttpBridgeNode(Node):
                     t_send_start=float(gripper_command["t_send_start"]),
                     t_send_end=float(gripper_command["t_send_end"]),
                 )
+            self._maybe_publish_action_heartbeat()
             self._publish_debug()
             return
 
@@ -748,6 +822,7 @@ class FrankaHttpBridgeNode(Node):
             t_send_end=t_send_end,
         )
 
+        self._maybe_publish_action_heartbeat()
         self._publish_debug()
 
 

@@ -77,6 +77,9 @@ tactile_vr_converter_node:
     http_status_topic: /hilserl/http_status_json
     robot_state_topic: /hilserl/robot_state_json
     enable_command_logging: true
+    # Republish the last successful HTTP target without sending another HTTP
+    # request, so the 10 Hz recorder always has a nearby held-action label.
+    action_heartbeat_hz: 20.0
     enable_state_poll: true
     state_poll_hz: 30.0
     state_poll_timeout_sec: 0.12
@@ -149,6 +152,7 @@ tactile_franka_http_bridge:
     http_status_topic: /hilserl/http_status_json
     robot_state_topic: /hilserl/robot_state_json
     enable_command_logging: true
+    action_heartbeat_hz: 20.0
     enable_state_poll: true
     state_poll_hz: 30.0
     state_poll_timeout_sec: 0.12

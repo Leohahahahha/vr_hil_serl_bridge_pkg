@@ -154,6 +154,29 @@ def now_monotonic() -> float:
     return float(time.monotonic())
 
 
+def ros_header_stamp_to_monotonic(
+    stamp: Any,
+    *,
+    receive_wall_ns: int,
+    receive_monotonic_ns: int,
+) -> float:
+    """Map a same-host ROS wall-clock stamp into the monotonic clock domain.
+
+    Camera callbacks otherwise use message receipt time, which folds DDS and
+    executor delay into the apparent capture time.  Invalid or clearly
+    different-clock stamps fall back to receipt time instead of corrupting the
+    synchronisation timeline.
+    """
+    stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+    receive_monotonic = receive_monotonic_ns * 1e-9
+    if stamp_ns <= 0:
+        return receive_monotonic
+    transport_ns = receive_wall_ns - stamp_ns
+    if abs(transport_ns) > 60_000_000_000:
+        return receive_monotonic
+    return float(receive_monotonic_ns - transport_ns) * 1e-9
+
+
 def ros_stamp_to_float_sec(stamp: Any) -> float:
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
@@ -205,6 +228,8 @@ class RecordConfig:
     max_state_dt_sec: float
     max_vr_dt_sec: float
     max_tactile_dt_sec: float
+    sync_lag_sec: float
+    use_image_header_stamp: bool
 
     save_master_parquet_every_episode: bool
     save_debug_jsonl: bool
@@ -267,6 +292,8 @@ def load_config(path: str | Path) -> RecordConfig:
         max_state_dt_sec=float(sync.get("max_state_dt_sec", 0.08)),
         max_vr_dt_sec=float(sync.get("max_vr_dt_sec", 0.10)),
         max_tactile_dt_sec=float(sync.get("max_tactile_dt_sec", 0.10)),
+        sync_lag_sec=max(0.0, float(sync.get("sync_lag_sec", 0.0))),
+        use_image_header_stamp=bool(sync.get("use_image_header_stamp", False)),
 
         save_master_parquet_every_episode=bool(output.get("save_master_parquet_every_episode", True)),
         save_debug_jsonl=bool(output.get("save_debug_jsonl", True)),
@@ -388,14 +415,36 @@ class RawCollectionNode(Node):
         self.get_logger().info(f"subscribe tactile right: {cfg.tactile_right_topic}")
 
     def _image_cb(self, msg: Image) -> None:
-        recv_t = now_monotonic()
+        receive_monotonic_ns = time.monotonic_ns()
+        receive_wall_ns = time.time_ns()
+        recv_t = receive_monotonic_ns * 1e-9
+        sample_t = (
+            ros_header_stamp_to_monotonic(
+                msg.header.stamp,
+                receive_wall_ns=receive_wall_ns,
+                receive_monotonic_ns=receive_monotonic_ns,
+            )
+            if self.cfg.use_image_header_stamp
+            else recv_t
+        )
         with self._lock:
-            self.image_buffer.append(recv_t, msg)
+            self.image_buffer.append(sample_t, msg)
 
     def _wrist_image_cb(self, msg: Image) -> None:
-        recv_t = now_monotonic()
+        receive_monotonic_ns = time.monotonic_ns()
+        receive_wall_ns = time.time_ns()
+        recv_t = receive_monotonic_ns * 1e-9
+        sample_t = (
+            ros_header_stamp_to_monotonic(
+                msg.header.stamp,
+                receive_wall_ns=receive_wall_ns,
+                receive_monotonic_ns=receive_monotonic_ns,
+            )
+            if self.cfg.use_image_header_stamp
+            else recv_t
+        )
         with self._lock:
-            self.wrist_image_buffer.append(recv_t, msg)
+            self.wrist_image_buffer.append(sample_t, msg)
 
     def _wrist_camera_info_cb(self, msg: CameraInfo) -> None:
         recv_t = now_monotonic()
@@ -404,6 +453,9 @@ class RawCollectionNode(Node):
 
     def _command_event_cb(self, msg: String) -> None:
         event = parse_json_str(msg.data)
+        http_info = event.get("http")
+        if isinstance(http_info, dict) and "ok" in http_info and not bool(http_info["ok"]):
+            return
         # Use pose-send start time as the action timestamp when available.
         t = float(event.get("http", {}).get("t_send_start", event.get("publish_time", now_monotonic())))
         with self._lock:
@@ -596,16 +648,9 @@ def record_episode(
         max_vr_dt_sec=cfg.max_vr_dt_sec,
         max_tactile_dt_sec=cfg.max_tactile_dt_sec,
     )
-    finish_tail_sec = max(
-        2.0 * period,
-        cfg.max_image_dt_sec,
-        cfg.max_wrist_image_dt_sec,
-        cfg.max_action_dt_sec,
-        cfg.max_state_dt_sec,
-        cfg.max_vr_dt_sec,
-        cfg.max_tactile_dt_sec,
-    )
+    sync_lag_sec = max(0.0, float(cfg.sync_lag_sec))
     episode_deadline = ep_start + cfg.max_episode_sec
+    max_loop_lag_sec = 0.0
 
     try:
         while True:
@@ -613,18 +658,24 @@ def record_episode(
             if controller.discard:
                 break
             stop_time = controller.finish_time
-            cutoff_time = episode_deadline if stop_time is None else stop_time + finish_tail_sec
+            cutoff_time = episode_deadline if stop_time is None else min(stop_time, episode_deadline)
             if next_t > cutoff_time:
                 if stop_time is None:
                     print("[RECORD] max_episode_sec reached, finishing episode.")
                 else:
-                    print(f"[RECORD] finish requested, draining tail for {finish_tail_sec:.2f}s")
+                    print(
+                        f"[RECORD] finish requested; all candidates through the stop time "
+                        f"were evaluated with sync_lag={sync_lag_sec:.2f}s"
+                    )
                 break
-            if now < next_t:
-                time.sleep(min(0.002, next_t - now))
+            evaluation_time = next_t + sync_lag_sec
+            if now < evaluation_time:
+                time.sleep(min(0.002, evaluation_time - now))
                 continue
 
             t_frame = next_t
+            loop_lag_sec = max(0.0, now - evaluation_time)
+            max_loop_lag_sec = max(max_loop_lag_sec, loop_lag_sec)
             timestamp = float(t_frame - ep_start)
             next_t += period
             candidate_count += 1
@@ -643,7 +694,10 @@ def record_episode(
                 elif cfg.debug and build_result.reason == "enabled false or missing" and skip_count % 20 == 0:
                     print(f"[SKIP] enabled false or missing. saved={saved_count} skip={skip_count}")
                 elif cfg.debug and skip_count % 10 == 0:
-                    print(f"[SKIP] saved={saved_count} skip={skip_count} {build_result.reason}")
+                    print(
+                        f"[SKIP] saved={saved_count} skip={skip_count} "
+                        f"loop_lag_ms={loop_lag_sec * 1000.0:.1f} {build_result.reason}"
+                    )
                 continue
 
             obs = build_result.frame
@@ -673,26 +727,31 @@ def record_episode(
             reason_vr = obs.reason_vr
 
             try:
-                image_rel_path, image_rec = writer.save_image(episode_index, saved_count, image_item.payload)
-                wrist_image_rel_path, wrist_image_rec = writer.save_wrist_image(
-                    episode_index, saved_count, wrist_image_item.payload
+                (
+                    image_rel_path,
+                    image_rec,
+                    wrist_image_rel_path,
+                    wrist_image_rec,
+                    tactile_left_rec,
+                    tactile_right_rec,
+                ) = writer.write_frame_assets(
+                    episode_index=episode_index,
+                    frame_index=saved_count,
+                    timestamp=timestamp,
+                    wall_time=t_frame,
+                    image_msg=image_item.payload,
+                    wrist_image_msg=wrist_image_item.payload,
+                    left_payload=tactile_left_payload,
+                    left_dt=float(dt_tactile_left),
+                    right_payload=tactile_right_payload,
+                    right_dt=float(dt_tactile_right),
                 )
             except Exception as e:
                 skip_count += 1
-                print(f"[WARN] image save failed: {repr(e)}")
+                print(f"[WARN] frame asset enqueue/write failed: {repr(e)}")
                 continue
 
             wrist_camera_info_fields = builder_camera_info_to_record(wrist_camera_info_item, t_frame)
-            tactile_left_rec, tactile_right_rec = writer.append_tactile_pair(
-                episode_index=episode_index,
-                frame_index=saved_count,
-                timestamp=timestamp,
-                wall_time=t_frame,
-                left_payload=tactile_left_payload,
-                left_dt=float(dt_tactile_left),
-                right_payload=tactile_right_payload,
-                right_dt=float(dt_tactile_right),
-            )
 
             row: dict[str, Any] = {
                 "timestamp": np.float32(timestamp),
@@ -713,6 +772,8 @@ def record_episode(
                 "action.target_gripper": float(action8[7]),
                 "action.target_gripper_width": float(target_gripper_width),
                 "action.command_type": str(command_event.get("command_type", command_event.get("type", ""))),
+                "action.heartbeat": bool(command_event.get("heartbeat", False)),
+                "action.repeated": bool(command_event.get("repeated", False)),
                 "action.pose_commanded": bool(command_event.get("pose_commanded", True)),
                 "action.gripper_commanded": bool(command_event.get("gripper_commanded", False)),
                 "action.motion_enabled": bool(command_event.get("enabled", False)),
@@ -789,6 +850,8 @@ def record_episode(
                 "target_gripper": float(action8[7]),
                 "target_gripper_width": float(target_gripper_width),
                 "command_type": str(command_event.get("command_type", command_event.get("type", ""))),
+                "heartbeat": bool(command_event.get("heartbeat", False)),
+                "repeated": bool(command_event.get("repeated", False)),
                 "pose_commanded": bool(command_event.get("pose_commanded", True)),
                 "gripper_commanded": bool(command_event.get("gripper_commanded", False)),
                 "motion_enabled": bool(command_event.get("enabled", False)),
@@ -808,7 +871,9 @@ def record_episode(
                     f"wrist={wrist_image_rec['width']}x{wrist_image_rec['height']} "
                     f"dt_wrist={dt_wrist_image:+.3f} "
                     f"dt_action={dt_action:+.3f} dt_state={dt_state:+.3f} "
-                    f"dt_tactile_left={dt_tactile_left:+.3f} dt_tactile_right={dt_tactile_right:+.3f}"
+                    f"dt_tactile_left={dt_tactile_left:+.3f} dt_tactile_right={dt_tactile_right:+.3f} "
+                    f"loop_lag_ms={loop_lag_sec * 1000.0:.1f} "
+                    f"writer_queue={writer.pending_write_tasks()}"
                 )
 
     finally:
@@ -827,7 +892,10 @@ def record_episode(
     writer.commit_episode(episode_index)
     if cfg.save_master_parquet_every_episode:
         writer.flush_master()
-    print(f"[DONE] episode {episode_index} saved={saved_count} skipped={skip_count}")
+    print(
+        f"[DONE] episode {episode_index} saved={saved_count} skipped={skip_count} "
+        f"max_loop_lag_ms={max_loop_lag_sec * 1000.0:.1f}"
+    )
     return True, controller.quit
 
 

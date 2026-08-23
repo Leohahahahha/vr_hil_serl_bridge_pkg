@@ -116,9 +116,13 @@ class RecordConfig:
     max_state_dt_sec: float
     max_vr_dt_sec: float
     max_tactile_dt_sec: float
+    sync_lag_sec: float
+    use_image_header_stamp: bool
 
     save_master_parquet_every_episode: bool
     save_debug_jsonl: bool
+    write_queue_size: int
+    tactile_batch_frames: int
 
 
 def _side_packed_topic(tactile: dict[str, Any], side: str, base_topic: str) -> str:
@@ -183,10 +187,14 @@ def load_config(path: str | Path) -> RecordConfig:
         max_state_dt_sec=float(sync.get("max_state_dt_sec", 0.08)),
         max_vr_dt_sec=float(sync.get("max_vr_dt_sec", 0.10)),
         max_tactile_dt_sec=float(sync.get("max_tactile_dt_sec", 0.15)),
+        sync_lag_sec=max(0.0, float(sync.get("sync_lag_sec", 0.25))),
+        use_image_header_stamp=bool(sync.get("use_image_header_stamp", True)),
         save_master_parquet_every_episode=bool(
             output.get("save_master_parquet_every_episode", True)
         ),
         save_debug_jsonl=bool(output.get("save_debug_jsonl", True)),
+        write_queue_size=max(4, int(output.get("write_queue_size", 48))),
+        tactile_batch_frames=max(1, int(output.get("tactile_batch_frames", 8))),
     )
 
 
@@ -402,16 +410,16 @@ class RawCollectionNode(CommonRawCollectionNode):
         self.cfg = cfg
         self._lock = threading.Lock()
 
-        self.image_buffer = TimedBuffer(maxlen=512)
-        self.wrist_image_buffer = TimedBuffer(maxlen=512)
-        self.wrist_camera_info_buffer = TimedBuffer(maxlen=512)
+        self.image_buffer = TimedBuffer(maxlen=96)
+        self.wrist_image_buffer = TimedBuffer(maxlen=96)
+        self.wrist_camera_info_buffer = TimedBuffer(maxlen=128)
         self.command_buffer = TimedBuffer(maxlen=4096)
         self.state_buffer = TimedBuffer(maxlen=4096)
         self.vr_pose_buffer = TimedBuffer(maxlen=2048)
         self.enabled_buffer = TimedBuffer(maxlen=2048)
         self.joystick_y_buffer = TimedBuffer(maxlen=2048)
-        self.tactile_left_buffer = TimedBuffer(maxlen=256)
-        self.tactile_right_buffer = TimedBuffer(maxlen=256)
+        self.tactile_left_buffer = TimedBuffer(maxlen=64)
+        self.tactile_right_buffer = TimedBuffer(maxlen=64)
 
         image_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -492,6 +500,13 @@ def main() -> None:
     print(f"[COMMAND] {cfg.command_event_topic}")
     print(f"[STATE] {cfg.robot_state_topic}")
     print(
+        f"[SYNC] lag={cfg.sync_lag_sec:.3f}s image_header_stamp={cfg.use_image_header_stamp}"
+    )
+    print(
+        f"[WRITER] queue={cfg.write_queue_size} tasks "
+        f"tactile_batch={cfg.tactile_batch_frames} frames"
+    )
+    print(
         f"[DM-TAC W] SDK 0.1.4 packed schema version: {DMTAC_SCHEMA_VERSION} "
         f"({DMTAC_IMAGE_SHAPE[1]}x{DMTAC_IMAGE_SHAPE[0]}, "
         f"{DMTAC_PACKED_FRAME_BYTES} bytes/side)"
@@ -534,6 +549,7 @@ def main() -> None:
         spin_thread.join(timeout=1.0)
         node.destroy_node()
         rclpy.shutdown()
+        writer.close()
 
     print("====== [END] legacy DM-Tac W recording finished ======")
 

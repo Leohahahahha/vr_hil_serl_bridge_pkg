@@ -88,6 +88,20 @@ only when the reported capture/pair time remains below the 33.3 ms period.
 Set publish_legacy_modalities to true only when the five old modality topics
 are explicitly needed; doing so restores their serialization/callback load.
 
+The recording pipeline keeps the 10 Hz candidate grid but evaluates each
+candidate after a configurable 250 ms synchronization lag. ZED and D405 image
+header stamps are mapped into the recorder's monotonic clock domain, so DDS
+callback delay is not mistaken for camera capture time. The Franka HTTP bridge
+publishes a 20 Hz held-action heartbeat without sending extra HTTP requests;
+real HTTP command events remain separately marked with `heartbeat=false`.
+
+For the 1.92 MB-per-side tactile payload, PNG encoding and tactile writes run
+on a bounded background queue. Left/right zarr arrays are resized and appended
+in aligned batches (eight frames by default), and episode commit/discard waits
+for a writer barrier before changing files. Watch `loop_lag_ms` and
+`max_loop_lag_ms` in recorder output: a sustained value near zero means disk
+work is no longer delaying the fixed-FPS synchronization loop.
+
 ## DM-Tac W to N0-VTLA canonical LeRobot
 
 The exporter decodes the lossless packed DM-Tac W zarr rows, maps
