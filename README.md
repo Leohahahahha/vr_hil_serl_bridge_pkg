@@ -68,19 +68,38 @@ ros2 launch vive_teleop_tactile_bridge full_stack.launch.py
 
 ## DM-Tac W packed acquisition
 
-The legacy SDK worker targets 30 Hz and reads the left/right sensors
-concurrently. Getters within one physical sensor remain serial because SDK
-0.1.4 does not expose an atomic snapshot API.
+The default `output_mode: shear_depth` requests only `getShear()` and
+`getDepth()` from each sensor. It publishes packed schema 3 (921,600 bytes per
+side), with channel data ordered as shear then depth. Set `output_mode: full`
+in both DM-Tac W YAML files only when the five legacy SDK outputs are required;
+that mode publishes schema 1 (1,920,000 bytes per side). The worker targets
+30 Hz and reads the left/right sensors concurrently. Getters within one
+physical sensor remain serial because SDK 0.1.4 does not expose an atomic
+snapshot API.
 
 The bridge publishes one latest-only packed message per side:
 
     /dmtac/left/packed_frame
     /dmtac/right/packed_frame
 
-Each packed message is a fixed-schema sensor_msgs/Image (8UC1,
-1,920,000 bytes). Its header timestamp is the SDK getter-group capture
-midpoint. The raw recorder maps that timestamp into its monotonic clock domain
-before selecting the nearest tactile frame for the 10 Hz trajectory.
+Each packed message is a latest-only `sensor_msgs/Image` (`8UC1`). Its header
+timestamp is the SDK getter-group capture midpoint. The raw recorder maps that
+timestamp into its monotonic clock domain before selecting the nearest tactile
+frame for the 10 Hz trajectory.
+
+After rebuilding and sourcing the ROS 2 workspace, start the tactile bridge and
+recorder in separate terminals:
+
+```bash
+ros2 launch vive_teleop_tactile_bridge dmtac_w_bridge.launch.py \
+  params_file:=/home/enine/ros2_hj/src/vr_hil_serl_bridge_pkg/config/dmtac_w_bridge.params.yaml
+
+ros2 run vive_teleop_tactile_bridge record_raw_hilserl_zed_tactile_dmtac_w \
+  --config /home/enine/ros2_hj/src/vr_hil_serl_bridge_pkg/config/record_hilserl_raw_tactile_dmtac_w.yaml
+```
+
+Use a new empty `dataset.root` after changing output mode. A schema-3 row must
+never be appended to an existing schema-1 zarr array.
 
 The worker reports actual_fps, per-side capture time, pair time, and
 left/right capture skew every five seconds. A configured 30 Hz target is valid
@@ -95,19 +114,20 @@ callback delay is not mistaken for camera capture time. The Franka HTTP bridge
 publishes a 20 Hz held-action heartbeat without sending extra HTTP requests;
 real HTTP command events remain separately marked with `heartbeat=false`.
 
-For the 1.92 MB-per-side tactile payload, PNG encoding and tactile writes run
-on a bounded background queue. Left/right zarr arrays are resized and appended
-in aligned batches (eight frames by default), and episode commit/discard waits
-for a writer barrier before changing files. Watch `loop_lag_ms` and
-`max_loop_lag_ms` in recorder output: a sustained value near zero means disk
-work is no longer delaying the fixed-FPS synchronization loop.
+PNG encoding and tactile writes run on a bounded background queue. Left/right
+zarr arrays are resized and appended in aligned batches (eight frames by
+default), and episode commit/discard waits for a writer barrier before changing
+files. Watch `loop_lag_ms` and `max_loop_lag_ms` in recorder output: a sustained
+value near zero means disk work is no longer delaying the fixed-FPS
+synchronization loop.
 
 ## DM-Tac W to N0-VTLA canonical LeRobot
 
-The exporter decodes the lossless packed DM-Tac W zarr rows, maps
-`[shear_x, shear_y, depth]` to two 3-channel tactile videos, and writes the
-N0-VTLA single-arm canonical schema (`observation.state`, `action`, and
-`action_mask` are all 32-dimensional; dimensions `0:10` are active).
+The exporter accepts legacy schema 1 and shear/depth schema 3, decodes either
+lossless layout to `[shear_x, shear_y, depth]`, maps it to two 3-channel tactile
+videos, and writes the N0-VTLA single-arm canonical schema
+(`observation.state`, `action`, and `action_mask` are all 32-dimensional;
+dimensions `0:10` are active).
 
 Install the offline conversion dependencies in the Python environment used by
 the command: `numpy`, `pandas`, `pyarrow`, `zarr`, `Pillow`, and OpenCV.

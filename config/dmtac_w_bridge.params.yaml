@@ -9,11 +9,15 @@ dmtac_w_bridge:
     left_serial: "M2505150082"
     right_serial: "M2505150198"
 
-    # Runtime-owned fixed mmap files; each retains only the newest 1.92 MB frame.
+    # Runtime-owned fixed mmap files; each retains only the newest frame.
     left_frame_path: "/dev/shm/dmtac_w_left.frame"
     right_frame_path: "/dev/shm/dmtac_w_right.frame"
 
     base_topic: "/dmtac"
+    # Default N0-VTLA path: call only getShear()/getDepth() and publish schema 3
+    # (921,600 bytes/side). Set to "full" for the legacy five-getter schema 1
+    # (1,920,000 bytes/side). Restart the bridge after changing this value.
+    output_mode: "shear_depth"
     # Worker target rate. The actual rate is reported every five seconds as
     # actual_fps/left_ms/right_ms/lr_skew_ms and may be lower if SDK getters
     # cannot finish within 33.3 ms per side.
@@ -27,7 +31,7 @@ dmtac_w_bridge:
     frame_timeout_sec: 10.0
     show_sdk_fps: false
 
-    # Latest-only packed transport avoids a reliable queue of 1.92 MB frames.
+    # Latest-only packed transport avoids a reliable queue of large frames.
     qos_depth: 1
     publish_legacy_modalities: false
     worker_shutdown_timeout_sec: 5.0

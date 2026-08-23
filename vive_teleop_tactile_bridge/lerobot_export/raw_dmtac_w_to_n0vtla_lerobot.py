@@ -2,10 +2,12 @@
 """Convert the raw DM-Tac W recording into N0-VTLA canonical LeRobot v3.
 
 The raw recorder stores each DM-Tac W sample as one lossless packed uint8 row
-in zarr.  This exporter decodes ``shear_x``, ``shear_y`` and ``depth``, applies
-one dataset-level linear mapping shared by both fingers, and writes the result
-as two three-channel tactile videos.  N0-VTLA then loads frame 0 as the
-zero-contact baseline and computes ``current - baseline`` itself.
+in zarr.  This exporter accepts both the legacy five-modality schema 1 and the
+shear/depth-only schema 3.  It decodes ``shear_x``, ``shear_y`` and ``depth``
+from either layout, applies one dataset-level linear mapping shared by both
+fingers, and writes the result as two three-channel tactile videos.  N0-VTLA
+then loads frame 0 as the zero-contact baseline and computes
+``current - baseline`` itself.
 
 The output follows the canonical N0-VTLA contract:
 
@@ -57,7 +59,26 @@ VIDEO_KEYS = (FRONT_KEY, WRIST_KEY, TACTILE_LEFT_KEY, TACTILE_RIGHT_KEY)
 
 TACTILE_CHANNELS = ("shear_x", "shear_y", "depth")
 EXPECTED_TACTILE_PACKAGE = "dmtac_tactile"
-EXPECTED_DMTAC_SCHEMA_VERSION = 1
+SUPPORTED_DMTAC_SCHEMA_VERSIONS = (1, 3)
+
+# Schema 2 is already used by a different DM-Tac recorder in this package, so
+# the compact W-sensor layout deliberately uses schema 3.  Keep these values
+# independent of the online bridge module: the offline exporter must remain
+# able to read an old dataset after the bridge implementation changes.
+_DMTAC_LAYOUTS: dict[int, dict[str, Any]] = {
+    1: {
+        "output_mode": "full",
+        "packed_frame_bytes": 1_920_000,
+        "shear": (998_400, 614_400, 240, 320, 2, 4),
+        "depth": (1_612_800, 307_200, 240, 320, 1, 4),
+    },
+    3: {
+        "output_mode": "shear_depth",
+        "packed_frame_bytes": 921_600,
+        "shear": (0, 614_400, 240, 320, 2, 4),
+        "depth": (614_400, 307_200, 240, 320, 1, 4),
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -121,20 +142,18 @@ class DMTacSource:
         layout = meta.get("layout")
         if not isinstance(layout, dict):
             raise ValueError(f"{self.side} zarr_index={index}: missing layout metadata")
-        if int(layout.get("schema_version", -1)) != EXPECTED_DMTAC_SCHEMA_VERSION:
-            raise ValueError(
-                f"{self.side} zarr_index={index}: unsupported schema_version="
-                f"{layout.get('schema_version')!r}"
-            )
-        if int(layout.get("byte_order_little_endian", 0)) != 1:
-            raise ValueError(f"{self.side} zarr_index={index}: only little-endian float32 is supported")
-        expected_bytes = int(layout.get("packed_frame_bytes", -1))
-        if packed.size != expected_bytes:
-            raise ValueError(
-                f"{self.side} zarr_index={index}: packed bytes {packed.size} != metadata {expected_bytes}"
-            )
+        _validate_dmtac_layout(
+            layout,
+            packed_size=int(packed.size),
+            context=f"{self.side} zarr_index={index}",
+        )
         shear = _decode_float_modality(packed, layout, "shear", expected_channels=2)
         depth = _decode_float_modality(packed, layout, "depth", expected_channels=1)
+        if shear.shape[:2] != depth.shape[:2]:
+            raise ValueError(
+                f"{self.side} zarr_index={index}: shear/depth spatial shapes differ: "
+                f"{shear.shape[:2]} != {depth.shape[:2]}"
+            )
         field = np.concatenate([shear, depth], axis=-1).astype(np.float32, copy=False)
         if field.shape[-1] != 3 or not np.all(np.isfinite(field)):
             raise ValueError(
@@ -142,6 +161,66 @@ class DMTacSource:
                 f"shape={field.shape}, finite={bool(np.isfinite(field).all())}"
             )
         return field
+
+    def schema_version(self, index: int) -> int:
+        """Return and validate the packed schema used by one recorded row."""
+        meta = self.metadata(index)
+        layout = meta.get("layout")
+        if not isinstance(layout, dict):
+            raise ValueError(f"{self.side} zarr_index={index}: missing layout metadata")
+        return _validate_dmtac_layout(
+            layout,
+            packed_size=int(self.array.shape[1]),
+            context=f"{self.side} zarr_index={index}",
+        )
+
+
+def _validate_dmtac_layout(
+    layout: dict[str, Any],
+    *,
+    packed_size: int,
+    context: str,
+) -> int:
+    schema_version = int(layout.get("schema_version", -1))
+    if schema_version not in SUPPORTED_DMTAC_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"{context}: unsupported schema_version={layout.get('schema_version')!r}; "
+            f"supported={list(SUPPORTED_DMTAC_SCHEMA_VERSIONS)}"
+        )
+    if int(layout.get("byte_order_little_endian", 0)) != 1:
+        raise ValueError(f"{context}: only little-endian float32 is supported")
+
+    expected = _DMTAC_LAYOUTS[schema_version]
+    expected_bytes = int(expected["packed_frame_bytes"])
+    metadata_bytes = int(layout.get("packed_frame_bytes", -1))
+    if metadata_bytes != expected_bytes or packed_size != expected_bytes:
+        raise ValueError(
+            f"{context}: schema {schema_version} packed bytes must be {expected_bytes}, "
+            f"got row={packed_size}, metadata={metadata_bytes}"
+        )
+
+    output_mode = layout.get("output_mode")
+    if output_mode is not None and str(output_mode) != str(expected["output_mode"]):
+        raise ValueError(
+            f"{context}: schema {schema_version} requires output_mode="
+            f"{expected['output_mode']!r}, got {output_mode!r}"
+        )
+
+    for name in ("shear", "depth"):
+        actual = (
+            int(layout.get(f"{name}_start", -1)),
+            int(layout.get(f"{name}_len", -1)),
+            int(layout.get(f"{name}_height", -1)),
+            int(layout.get(f"{name}_width", -1)),
+            int(layout.get(f"{name}_channels", -1)),
+            int(layout.get(f"{name}_itemsize", -1)),
+        )
+        if actual != expected[name]:
+            raise ValueError(
+                f"{context}: schema {schema_version} {name} layout {actual} "
+                f"!= expected {expected[name]}"
+            )
+    return schema_version
 
 
 def _decode_float_modality(
@@ -328,6 +407,7 @@ def export_raw_dmtac_w_to_n0vtla_lerobot(
     frames: list[FrameRef] = []
     episode_rows: list[dict[str, Any]] = []
     timing_reports: list[dict[str, Any]] = []
+    source_schema_versions: set[int] = set()
     global_index = 0
 
     for raw_episode_path in episode_paths:
@@ -385,6 +465,8 @@ def export_raw_dmtac_w_to_n0vtla_lerobot(
             right_index = int(raw_row["tactile.right.zarr_index"])
             left_meta = left_source.metadata(left_index)
             right_meta = right_source.metadata(right_index)
+            source_schema_versions.add(left_source.schema_version(left_index))
+            source_schema_versions.add(right_source.schema_version(right_index))
             _check_tactile_sync(left_meta, max_tactile_sync_sec, "left", left_index)
             _check_tactile_sync(right_meta, max_tactile_sync_sec, "right", right_index)
             left_frame_ids.append(int(left_meta["frame_idx"]))
@@ -524,7 +606,8 @@ def export_raw_dmtac_w_to_n0vtla_lerobot(
 
     tactile_encoding = {
         "version": 1,
-        "source": "DM-Tac W SDK 0.1.4 packed schema 1",
+        "source": "DM-Tac W lossless packed tactile rows",
+        "source_schema_versions": sorted(source_schema_versions),
         "source_channels": list(TACTILE_CHANNELS),
         "video_rgb_channels": list(TACTILE_CHANNELS),
         "scales": {name: float(scale) for name, scale in zip(TACTILE_CHANNELS, scales, strict=True)},
@@ -552,6 +635,7 @@ def export_raw_dmtac_w_to_n0vtla_lerobot(
         video_codec=video_codec,
         task=task_text,
         gripper_output_unit=gripper_output_unit,
+        source_schema_versions=sorted(source_schema_versions),
     )
     _write_json(info_path, info)
 
@@ -564,6 +648,7 @@ def export_raw_dmtac_w_to_n0vtla_lerobot(
         "fps": fps_value,
         "total_frames": len(rows),
         "total_episodes": len(episode_rows),
+        "source_tactile_schema_versions": sorted(source_schema_versions),
         "source_episode_metadata": source_episode_metadata,
         "orphan_tactile_rows": {
             "left": int(left_source.array.shape[0] - len({f.tactile_left_index for f in frames})),
@@ -985,6 +1070,7 @@ def _build_info(
     video_codec: str,
     task: str,
     gripper_output_unit: str,
+    source_schema_versions: list[int],
 ) -> dict[str, Any]:
     features: dict[str, Any] = {
         STATE_KEY: {"dtype": "float32", "shape": [32], "names": None},
@@ -1028,6 +1114,7 @@ def _build_info(
         "active_action_dims": [0, 10],
         "gripper_unit": gripper_output_unit,
         "tactile_msg_package": EXPECTED_TACTILE_PACKAGE,
+        "source_tactile_schema_versions": source_schema_versions,
         "tactile_encoding_path": "meta/tactile_encoding.json",
         "fps": fps,
         "task": task,

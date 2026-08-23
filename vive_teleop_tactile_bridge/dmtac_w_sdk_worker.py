@@ -29,7 +29,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from dmtac_w_ipc import MMapFrameWriter, PAYLOAD_BYTES, pack_modalities  # noqa: E402
+from dmtac_w_ipc import (  # noqa: E402
+    OUTPUT_MODE_FULL,
+    OUTPUT_MODE_SHEAR_DEPTH,
+    OUTPUT_MODES,
+    MMapFrameWriter,
+    get_payload_bytes,
+    normalize_output_mode,
+    pack_modalities,
+)
 
 
 STATUS_OK = 0
@@ -48,33 +56,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--startup-timeout-sec", type=float, default=60.0)
     parser.add_argument("--warmup-cycles", type=int, default=3)
     parser.add_argument("--show-sdk-fps", action="store_true")
+    parser.add_argument(
+        "--output-mode",
+        choices=OUTPUT_MODES,
+        default=OUTPUT_MODE_FULL,
+        help="SDK modalities to request and publish",
+    )
     return parser.parse_args()
 
 
-def _read_modalities(sensor: Any) -> dict[str, np.ndarray]:
-    return {
-        "raw_image": np.asarray(sensor.getRawImage()),
-        "deformation2d": np.asarray(sensor.getDeformation2D()),
-        "normal": np.asarray(sensor.getNormal()),
-        "shear": np.asarray(sensor.getShear()),
-        "depth": np.asarray(sensor.getDepth()),
-    }
+def _read_modalities(sensor: Any, output_mode: str) -> dict[str, np.ndarray]:
+    if output_mode == OUTPUT_MODE_SHEAR_DEPTH:
+        # Deliberately do not call the other three SDK getters in compact mode.
+        return {
+            "shear": np.asarray(sensor.getShear()),
+            "depth": np.asarray(sensor.getDepth()),
+        }
+    if output_mode == OUTPUT_MODE_FULL:
+        return {
+            "raw_image": np.asarray(sensor.getRawImage()),
+            "deformation2d": np.asarray(sensor.getDeformation2D()),
+            "normal": np.asarray(sensor.getNormal()),
+            "shear": np.asarray(sensor.getShear()),
+            "depth": np.asarray(sensor.getDepth()),
+        }
+    raise ValueError(f"unsupported DM-Tac output_mode={output_mode!r}")
 
 
-def _sample_sensor(sensor: Any) -> tuple[int, int, bytes]:
+def _sample_sensor(sensor: Any, output_mode: str) -> tuple[int, int, bytes]:
     capture_start_ns = time.time_ns()
-    arrays = _read_modalities(sensor)
+    arrays = _read_modalities(sensor, output_mode)
     capture_end_ns = time.time_ns()
-    payload = pack_modalities(arrays)
+    payload = pack_modalities(arrays, output_mode)
     return capture_start_ns, capture_end_ns, payload
 
 
 def _sample_sensors_parallel(
-    sensors: dict[str, Any], executor: ThreadPoolExecutor
+    sensors: dict[str, Any], executor: ThreadPoolExecutor, output_mode: str
 ) -> dict[str, tuple[int, int, bytes]]:
     """Read left/right sensors concurrently; getters within one sensor stay serial."""
     futures = {
-        side: executor.submit(_sample_sensor, sensor)
+        side: executor.submit(_sample_sensor, sensor, output_mode)
         for side, sensor in sensors.items()
     }
     samples: dict[str, tuple[int, int, bytes]] = {}
@@ -129,6 +151,7 @@ def _warm_up(
     cycles: int,
     stop_event: threading.Event,
     executor: ThreadPoolExecutor,
+    output_mode: str,
 ) -> None:
     print(
         f"[SDK] warming up {cycles} cycle(s); these samples are discarded",
@@ -138,7 +161,7 @@ def _warm_up(
         if stop_event.is_set():
             raise InterruptedError("worker stopped during warmup")
         started = time.monotonic()
-        samples = _sample_sensors_parallel(sensors, executor)
+        samples = _sample_sensors_parallel(sensors, executor, output_mode)
         pair_elapsed_ms = (time.monotonic() - started) * 1000.0
         for side, (capture_start_ns, capture_end_ns, _payload) in samples.items():
             elapsed_ms = (capture_end_ns - capture_start_ns) / 1_000_000.0
@@ -150,6 +173,8 @@ def _warm_up(
 
 
 def run(args: argparse.Namespace) -> int:
+    output_mode = normalize_output_mode(args.output_mode)
+    payload_bytes = get_payload_bytes(output_mode)
     if args.left_serial == args.right_serial:
         raise ValueError("left and right DM-Tac W serial numbers must differ")
     if args.session_id <= 0:
@@ -189,8 +214,16 @@ def run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, request_stop)
 
     writers = {
-        "left": MMapFrameWriter(args.left_frame_path, session_id=args.session_id),
-        "right": MMapFrameWriter(args.right_frame_path, session_id=args.session_id),
+        "left": MMapFrameWriter(
+            args.left_frame_path,
+            session_id=args.session_id,
+            output_mode=output_mode,
+        ),
+        "right": MMapFrameWriter(
+            args.right_frame_path,
+            session_id=args.session_id,
+            output_mode=output_mode,
+        ),
     }
     sensors: dict[str, Any] = {}
     sampler_pool: ThreadPoolExecutor | None = None
@@ -223,10 +256,12 @@ def run(args: argparse.Namespace) -> int:
             cycles=args.warmup_cycles,
             stop_event=stop_event,
             executor=sampler_pool,
+            output_mode=output_mode,
         )
 
         print(
-            f"[SDK] streaming at {args.fps:.3f} Hz; payload={PAYLOAD_BYTES} bytes/side",
+            f"[SDK] streaming at {args.fps:.3f} Hz; output_mode={output_mode} "
+            f"payload={payload_bytes} bytes/side",
             flush=True,
         )
         period_sec = 1.0 / args.fps
@@ -239,7 +274,9 @@ def run(args: argparse.Namespace) -> int:
         while not stop_event.is_set():
             pair_started = time.monotonic()
             try:
-                samples = _sample_sensors_parallel(sensors, sampler_pool)
+                samples = _sample_sensors_parallel(
+                    sensors, sampler_pool, output_mode
+                )
             except Exception:
                 # A getter can fail if the device starts an internal reset. If
                 # the status confirms that case, discard the whole pair and
@@ -261,6 +298,7 @@ def run(args: argparse.Namespace) -> int:
                         cycles=args.warmup_cycles,
                         stop_event=stop_event,
                         executor=sampler_pool,
+                        output_mode=output_mode,
                     )
                     next_deadline = time.monotonic()
                     continue
@@ -294,6 +332,7 @@ def run(args: argparse.Namespace) -> int:
                     cycles=args.warmup_cycles,
                     stop_event=stop_event,
                     executor=sampler_pool,
+                    output_mode=output_mode,
                 )
                 next_deadline = time.monotonic()
                 continue

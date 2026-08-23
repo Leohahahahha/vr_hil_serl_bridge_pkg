@@ -1,9 +1,9 @@
 # Total raw collection config for the x86_64 DM-Tac W SDK 0.1.4 bridge.
 
 dataset:
-  # Always use a new empty root; this schema differs from SDK 1.2.13.1 datasets.
+  # Always use a new empty root. Never append schema-3 rows to a schema-1 zarr.
   #root: "/home/enine/data_collect/vive_teleop_tactile/ros2_ws_recording_patch/dataset_tactile/fr3_zed_raw_tactile_dmtac_w_sdk014"
-  root: "/home/enine/data_collect/datasets/dmtac_w/smoke_all5_20260820_001"
+  root: "/home/enine/data_collect/datasets/dmtac_w/smoke_shear_depth_20260823_001"
   
 record:
   fps: 10.0
@@ -36,9 +36,12 @@ wrist_image:
 tactile:
   msg_package: "dmtac_tactile"
   base_topic: "/dmtac"
-  # The bridge samples at up to 30 Hz and publishes one fixed 1.92 MB packed
-  # message per side. The 10 Hz recorder selects the nearest frame by the
-  # worker's capture timestamp mapped into the monotonic clock domain.
+  # Must match dmtac_w_bridge.params.yaml. "shear_depth" records schema 3
+  # (921,600 bytes/side); switch both files to "full" for legacy schema 1.
+  output_mode: "shear_depth"
+  # The bridge samples at up to 30 Hz and publishes one packed message per
+  # side. The 10 Hz recorder selects the nearest frame by the worker's capture
+  # timestamp mapped into the monotonic clock domain.
   left:
     packed_topic: "/dmtac/left/packed_frame"
   right:

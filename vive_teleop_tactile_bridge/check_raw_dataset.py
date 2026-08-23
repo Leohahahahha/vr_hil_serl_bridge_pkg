@@ -110,6 +110,8 @@ def check_raw_dataset(root: Path, sample_images: int, report: Reporter) -> None:
             f"dataset_type={info.get('dataset_type')}, "
             f"fps={info.get('fps')}, "
             f"tactile_msg_package={info.get('tactile_msg_package')}, "
+            f"tactile_output_mode={info.get('tactile_output_mode')}, "
+            f"tactile_schema_version={info.get('tactile_schema_version')}, "
             f"state_dim={info.get('state_dim')}, "
             f"action_dim={info.get('action_dim')}"
         )
@@ -139,6 +141,7 @@ def check_raw_dataset(root: Path, sample_images: int, report: Reporter) -> None:
     _check_images(root, df, "wrist_image", "wrist_image.path", sample_images, report)
     _check_tactile(root, df, "left", info, report)
     _check_tactile(root, df, "right", info, report)
+    _check_dmtac_cross_side(df, info, report)
 
 
 def _read_json(path: Path, report: Reporter) -> dict[str, Any]:
@@ -389,16 +392,17 @@ def _check_tactile(root: Path, df: pd.DataFrame, side: str, info: dict[str, Any]
         if dtypes and dtypes != [str(arr.dtype)]:
             report.error(f"{prefix}: data_dtype values {dtypes} != zarr dtype {arr.dtype}")
 
-    _check_tactile_package_expectation(prefix, info.get("tactile_msg_package"), arr, df, report)
+    _check_tactile_package_expectation(prefix, info, arr, df, report)
 
 
 def _check_tactile_package_expectation(
     prefix: str,
-    package: Any,
+    info: dict[str, Any],
     arr: Any,
     df: pd.DataFrame,
     report: Reporter,
 ) -> None:
+    package = info.get("tactile_msg_package")
     if not package:
         return
     package = str(package)
@@ -415,10 +419,16 @@ def _check_tactile_package_expectation(
     elif package == "dmtac_tactile":
         if str(arr.dtype) != "uint8":
             report.warn(f"{prefix}: DM-Tac expected uint8 packed zarr, got {arr.dtype}")
-        _check_dmtac_layout(prefix, arr, df, report)
+        _check_dmtac_layout(prefix, arr, df, info, report)
 
 
-def _check_dmtac_layout(prefix: str, arr: Any, df: pd.DataFrame, report: Reporter) -> None:
+def _check_dmtac_layout(
+    prefix: str,
+    arr: Any,
+    df: pd.DataFrame,
+    info: dict[str, Any],
+    report: Reporter,
+) -> None:
     schema_column = f"{prefix}.schema_version"
     packed_column = f"{prefix}.packed_frame_bytes"
     if schema_column not in df.columns or packed_column not in df.columns:
@@ -458,9 +468,21 @@ def _check_dmtac_layout(prefix: str, arr: Any, df: pd.DataFrame, report: Reporte
         )
         expected_layout = None
         expected_packed_bytes = None
+        expected_output_mode = None
+    elif schema_version == 3:
+        segments = ("shear", "depth")
+        expected_layout = {
+            "shear": (240, 320, 2, 4),
+            "depth": (240, 320, 1, 4),
+        }
+        expected_packed_bytes = 921_600
+        expected_output_mode = "shear_depth"
     else:
         report.error(f"{prefix}: unsupported DM-Tac schema version {schema_version}")
         return
+
+    if schema_version == 1:
+        expected_output_mode = "full"
 
     layout_fields = ("start", "len", "height", "width", "channels", "itemsize")
     required = [schema_column, packed_column]
@@ -522,6 +544,53 @@ def _check_dmtac_layout(prefix: str, arr: Any, df: pd.DataFrame, report: Reporte
             f"{prefix}: packed_frame_bytes {packed_bytes} != verified "
             f"DM-Tac W size {expected_packed_bytes}"
         )
+
+    # The explicit format metadata was introduced with schema 3. Keep legacy
+    # schema-1/2 datasets valid when these keys are absent, but validate them
+    # whenever present.
+    expected_info = {
+        "tactile_schema_version": schema_version,
+        "tactile_packed_frame_bytes": packed_bytes,
+    }
+    if expected_output_mode is not None:
+        expected_info["tactile_output_mode"] = expected_output_mode
+    for key, expected_value in expected_info.items():
+        if key not in info:
+            if schema_version == 3:
+                report.error(f"{prefix}: schema 3 requires meta/info.json {key}")
+            continue
+        if info[key] != expected_value:
+            report.error(
+                f"{prefix}: meta/info.json {key}={info[key]!r} != {expected_value!r}"
+            )
+
+
+def _check_dmtac_cross_side(
+    df: pd.DataFrame,
+    info: dict[str, Any],
+    report: Reporter,
+) -> None:
+    """Reject a dataset whose two tactile sides use different packed schemas."""
+    if str(info.get("tactile_msg_package", "")) != "dmtac_tactile":
+        return
+    for field in ("schema_version", "packed_frame_bytes"):
+        side_values: dict[str, list[int]] = {}
+        for side in ("left", "right"):
+            column = f"tactile.{side}.{field}"
+            if column not in df.columns:
+                continue
+            side_values[side] = sorted(
+                pd.to_numeric(df[column], errors="coerce")
+                .dropna()
+                .astype(int)
+                .unique()
+                .tolist()
+            )
+        if len(side_values) == 2 and side_values["left"] != side_values["right"]:
+            report.error(
+                f"DM-Tac left/right {field} mismatch: "
+                f"left={side_values['left']}, right={side_values['right']}"
+            )
 
 
 if __name__ == "__main__":

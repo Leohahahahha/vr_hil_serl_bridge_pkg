@@ -2,10 +2,11 @@
 """Record HIL-SERL data with two legacy DM-Tac W SDK 0.1.4 sensors.
 
 The same-host bridge publishes one fixed-layout packed frame per sensor. The
-worker reads the two sensors concurrently while keeping each sensor's five SDK
-getters serial. The packed message carries the SDK capture midpoint; the
-recorder maps it into the monotonic clock domain before nearest-frame matching.
-The legacy SDK does not expose a hardware frame id or an atomic snapshot API.
+``full`` output mode retains the five-modality schema used by existing datasets;
+``shear_depth`` records only the two modalities consumed by N0-VTLA. The packed
+message carries the SDK capture midpoint; the recorder maps it into the
+monotonic clock domain before nearest-frame matching. The legacy SDK does not
+expose a hardware frame id or an atomic snapshot API.
 """
 from __future__ import annotations
 
@@ -30,7 +31,10 @@ try:
         PACKED_IMAGE_ENCODING,
         PAYLOAD_BYTES,
         capture_wall_ns_to_monotonic_sec,
+        get_payload_bytes,
+        normalize_output_mode,
         packed_layout_metadata,
+        schema_version_for_mode,
     )
     from .raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter
     from .record_raw_hilserl_zed_tactile_paxini import (
@@ -46,7 +50,10 @@ except ImportError:
         PACKED_IMAGE_ENCODING,
         PAYLOAD_BYTES,
         capture_wall_ns_to_monotonic_sec,
+        get_payload_bytes,
+        normalize_output_mode,
         packed_layout_metadata,
+        schema_version_for_mode,
     )
     from raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter  # type: ignore
     from record_raw_hilserl_zed_tactile_paxini import (  # type: ignore
@@ -59,7 +66,8 @@ except ImportError:
     )
 
 
-DMTAC_SCHEMA_VERSION = 1
+# Retain these aliases for callers that explicitly use the legacy full schema.
+DMTAC_SCHEMA_VERSION = schema_version_for_mode("full")
 DMTAC_IMAGE_SHAPE = (240, 320)
 DMTAC_PACKED_FRAME_BYTES = PAYLOAD_BYTES
 
@@ -107,6 +115,9 @@ class RecordConfig:
     command_event_topic: str
     robot_state_topic: str
     tactile_msg_package: str
+    tactile_output_mode: str
+    tactile_schema_version: int
+    tactile_packed_frame_bytes: int
     tactile_left_packed_topic: str
     tactile_right_packed_topic: str
 
@@ -152,6 +163,9 @@ def load_config(path: str | Path) -> RecordConfig:
         raise ValueError(
             f"DM-Tac recorder requires tactile.msg_package=dmtac_tactile, got: {tactile_msg_package}"
         )
+    tactile_output_mode = normalize_output_mode(tactile.get("output_mode", "full"))
+    tactile_schema_version = schema_version_for_mode(tactile_output_mode)
+    tactile_packed_frame_bytes = get_payload_bytes(tactile_output_mode)
     base_topic = str(tactile.get("base_topic", "/dmtac")).rstrip("/")
     if not base_topic.startswith("/"):
         raise ValueError("tactile.base_topic must be an absolute ROS topic namespace")
@@ -179,6 +193,9 @@ def load_config(path: str | Path) -> RecordConfig:
         command_event_topic=str(command.get("command_event_topic", "/hilserl/command_event_json")),
         robot_state_topic=str(robot_state.get("state_topic", "/hilserl/robot_state_json")),
         tactile_msg_package=tactile_msg_package,
+        tactile_output_mode=tactile_output_mode,
+        tactile_schema_version=tactile_schema_version,
+        tactile_packed_frame_bytes=tactile_packed_frame_bytes,
         tactile_left_packed_topic=_side_packed_topic(tactile, "left", base_topic),
         tactile_right_packed_topic=_side_packed_topic(tactile, "right", base_topic),
         max_image_dt_sec=float(sync.get("max_image_dt_sec", 0.10)),
@@ -287,23 +304,45 @@ def _packed_msg_to_payload(
     *,
     side: str,
     sensor_index: int,
+    output_mode: str,
+    expected_schema_version: int,
     receive_monotonic_ns: int,
     receive_wall_ns: int,
 ) -> tuple[float, dict[str, Any]]:
-    if int(msg.height) != 1 or int(msg.width) != DMTAC_PACKED_FRAME_BYTES:
+    output_mode = normalize_output_mode(output_mode)
+    schema_version = schema_version_for_mode(output_mode)
+    if schema_version != int(expected_schema_version):
         raise ValueError(
-            f"{side} packed frame shape must be 1x{DMTAC_PACKED_FRAME_BYTES}, "
+            "configured DM-Tac mode/schema mismatch: "
+            f"output_mode={output_mode!r} maps to schema {schema_version}, "
+            f"expected_schema_version={expected_schema_version}"
+        )
+    expected_bytes = get_payload_bytes(output_mode)
+    layout = packed_layout_metadata(output_mode)
+    if int(layout.get("schema_version", -1)) != schema_version:
+        raise RuntimeError(
+            f"DM-Tac IPC layout schema mismatch for output_mode={output_mode!r}: {layout}"
+        )
+    if int(layout.get("packed_frame_bytes", -1)) != expected_bytes:
+        raise RuntimeError(
+            f"DM-Tac IPC layout size mismatch for output_mode={output_mode!r}: {layout}"
+        )
+
+    if int(msg.height) != 1 or int(msg.width) != expected_bytes:
+        raise ValueError(
+            f"{side} packed frame shape must be 1x{expected_bytes} for "
+            f"output_mode={output_mode!r}/schema={schema_version}, "
             f"got {msg.height}x{msg.width}"
         )
-    if str(msg.encoding) != PACKED_IMAGE_ENCODING or int(msg.step) != DMTAC_PACKED_FRAME_BYTES:
+    if str(msg.encoding) != PACKED_IMAGE_ENCODING or int(msg.step) != expected_bytes:
         raise ValueError(
             f"{side} packed frame encoding/step mismatch: "
-            f"encoding={msg.encoding!r}, step={msg.step}"
+            f"encoding={msg.encoding!r}, step={msg.step}, expected_step={expected_bytes}"
         )
     packed = np.frombuffer(msg.data, dtype=np.uint8).reshape(-1).copy()
-    if packed.size != DMTAC_PACKED_FRAME_BYTES:
+    if packed.size != expected_bytes:
         raise ValueError(
-            f"{side} packed frame bytes={packed.size}, expected={DMTAC_PACKED_FRAME_BYTES}"
+            f"{side} packed frame bytes={packed.size}, expected={expected_bytes}"
         )
     sensor_id, sdk_fid = _parse_frame_id(str(msg.header.frame_id))
     capture_wall_ns = (
@@ -331,8 +370,10 @@ def _packed_msg_to_payload(
         "data_dtype": "uint8",
         "source_dtype": (
             "raw_image:uint8;deformation2d,normal,shear,depth:float32_le"
+            if output_mode == "full"
+            else "shear,depth:float32_le"
         ),
-        "layout": packed_layout_metadata(),
+        "layout": layout,
         "ros_stamp_sec": int(msg.header.stamp.sec),
         "ros_stamp_nanosec": int(msg.header.stamp.nanosec),
         "ros_stamp_float": capture_wall_sec,
@@ -473,6 +514,8 @@ class RawCollectionNode(CommonRawCollectionNode):
                 msg,
                 side=side,
                 sensor_index=sensor_index,
+                output_mode=self.cfg.tactile_output_mode,
+                expected_schema_version=self.cfg.tactile_schema_version,
                 receive_monotonic_ns=receive_monotonic_ns,
                 receive_wall_ns=receive_wall_ns,
             )
@@ -500,6 +543,11 @@ def main() -> None:
     print(f"[COMMAND] {cfg.command_event_topic}")
     print(f"[STATE] {cfg.robot_state_topic}")
     print(
+        f"[DM-TAC W] output_mode={cfg.tactile_output_mode} "
+        f"schema={cfg.tactile_schema_version} "
+        f"bytes/side={cfg.tactile_packed_frame_bytes}"
+    )
+    print(
         f"[SYNC] lag={cfg.sync_lag_sec:.3f}s image_header_stamp={cfg.use_image_header_stamp}"
     )
     print(
@@ -507,9 +555,9 @@ def main() -> None:
         f"tactile_batch={cfg.tactile_batch_frames} frames"
     )
     print(
-        f"[DM-TAC W] SDK 0.1.4 packed schema version: {DMTAC_SCHEMA_VERSION} "
+        f"[DM-TAC W] SDK 0.1.4 packed schema version: {cfg.tactile_schema_version} "
         f"({DMTAC_IMAGE_SHAPE[1]}x{DMTAC_IMAGE_SHAPE[0]}, "
-        f"{DMTAC_PACKED_FRAME_BYTES} bytes/side)"
+        f"{cfg.tactile_packed_frame_bytes} bytes/side)"
     )
 
     writer = RawDatasetWriter(cfg, config_path=cfg_path, profile=DMTAC_W_RAW_WRITER_PROFILE)

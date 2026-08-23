@@ -25,11 +25,13 @@ from sensor_msgs.msg import Image
 from .dmtac_w_ipc import (
     IMAGE_HEIGHT,
     IMAGE_WIDTH,
-    MODALITY_SPECS,
+    OUTPUT_MODE_FULL,
     PACKED_IMAGE_ENCODING,
-    PAYLOAD_BYTES,
     FrameSnapshot,
     MMapFrameReader,
+    get_modality_specs,
+    get_payload_bytes,
+    normalize_output_mode,
     payload_segment,
 )
 
@@ -53,6 +55,7 @@ class DMTacWBridge(Node):
         self.declare_parameter("frame_timeout_sec", 10.0)
         self.declare_parameter("warmup_cycles", 3)
         self.declare_parameter("show_sdk_fps", False)
+        self.declare_parameter("output_mode", OUTPUT_MODE_FULL)
         self.declare_parameter("qos_depth", 1)
         self.declare_parameter("publish_legacy_modalities", False)
         self.declare_parameter("worker_shutdown_timeout_sec", 5.0)
@@ -90,6 +93,11 @@ class DMTacWBridge(Node):
         self.frame_timeout_sec = float(self.get_parameter("frame_timeout_sec").value)
         self.warmup_cycles = int(self.get_parameter("warmup_cycles").value)
         self.show_sdk_fps = bool(self.get_parameter("show_sdk_fps").value)
+        self.output_mode = normalize_output_mode(
+            str(self.get_parameter("output_mode").value)
+        )
+        self.modality_specs = get_modality_specs(self.output_mode)
+        self.payload_bytes = get_payload_bytes(self.output_mode)
         self.qos_depth = int(self.get_parameter("qos_depth").value)
         self.publish_legacy_modalities = bool(
             self.get_parameter("publish_legacy_modalities").value
@@ -122,13 +130,18 @@ class DMTacWBridge(Node):
                 prefix = f"{self.base_topic}/{side}"
                 self._image_publishers[side] = {
                     spec.name: self.create_publisher(Image, f"{prefix}/{spec.name}", legacy_qos)
-                    for spec in MODALITY_SPECS
+                    for spec in self.modality_specs
                 }
 
         self.readers = {
-            side: MMapFrameReader(path, session_id=self.session_id)
+            side: MMapFrameReader(
+                path,
+                session_id=self.session_id,
+                output_mode=self.output_mode,
+            )
             for side, path in self.frame_paths.items()
         }
+        self._last_ipc_warning_monotonic = {"left": 0.0, "right": 0.0}
         self.last_sequences = {"left": 0, "right": 0}
         self.last_frame_indices = {"left": 0, "right": 0}
         self.last_frame_monotonic: dict[str, float | None] = {
@@ -151,6 +164,7 @@ class DMTacWBridge(Node):
         self.get_logger().info(
             f"DM-Tac W bridge ready: left={self.serials['left']} "
             f"right={self.serials['right']} target_fps={self.max_fps} "
+            f"output_mode={self.output_mode} payload={self.payload_bytes} bytes/side "
             f"packed_topics={self.base_topic}/<side>/packed_frame "
             f"legacy_modalities={self.publish_legacy_modalities}"
         )
@@ -204,6 +218,8 @@ class DMTacWBridge(Node):
             str(self.startup_timeout_sec),
             "--warmup-cycles",
             str(self.warmup_cycles),
+            "--output-mode",
+            self.output_mode,
         ]
         if self.show_sdk_fps:
             command.append("--show-sdk-fps")
@@ -224,6 +240,10 @@ class DMTacWBridge(Node):
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+        )
+        self.get_logger().info(
+            f"SDK worker started: pid={self._worker.pid} session_id={self.session_id} "
+            f"output_mode={self.output_mode}"
         )
         self._worker_log_thread = threading.Thread(
             target=self._forward_worker_logs,
@@ -264,15 +284,15 @@ class DMTacWBridge(Node):
         self._stamp_image(packed, capture_ns)
         packed.header.frame_id = frame_id
         packed.height = 1
-        packed.width = PAYLOAD_BYTES
+        packed.width = self.payload_bytes
         packed.encoding = PACKED_IMAGE_ENCODING
         packed.is_bigendian = 0
-        packed.step = PAYLOAD_BYTES
+        packed.step = self.payload_bytes
         packed.data = snapshot.payload
         self._packed_publishers[side].publish(packed)
 
         if self.publish_legacy_modalities:
-            for spec in MODALITY_SPECS:
+            for spec in self.modality_specs:
                 message = Image()
                 self._stamp_image(message, capture_ns)
                 message.header.frame_id = frame_id
@@ -281,7 +301,9 @@ class DMTacWBridge(Node):
                 message.encoding = spec.encoding
                 message.is_bigendian = 0
                 message.step = spec.step
-                message.data = payload_segment(snapshot.payload, spec)
+                message.data = payload_segment(
+                    snapshot.payload, spec, self.output_mode
+                )
                 self._image_publishers[side][spec.name].publish(message)
 
     def _poll_shared_frames(self) -> None:
@@ -304,10 +326,22 @@ class DMTacWBridge(Node):
                 snapshot = reader.read_new(self.last_sequences[side])
             except Exception as exc:
                 self._set_background_error(
-                    RuntimeError(f"failed to read {side} shared frame: {exc!r}")
+                    RuntimeError(
+                        f"failed to read {side} shared frame: {exc!r}; "
+                        f"worker_pid={worker.pid}, session_id={self.session_id}"
+                    )
                 )
                 return
             if snapshot is None:
+                diagnostic = reader.last_layout_diagnostic
+                if diagnostic is not None:
+                    last_warning = self._last_ipc_warning_monotonic[side]
+                    if now - last_warning >= 5.0:
+                        self.get_logger().warning(
+                            f"transient {side} shared-frame mismatch; retrying: "
+                            f"{diagnostic}; worker_pid={worker.pid}"
+                        )
+                        self._last_ipc_warning_monotonic[side] = now
                 continue
             if snapshot.frame_idx <= self.last_frame_indices[side]:
                 self._set_background_error(

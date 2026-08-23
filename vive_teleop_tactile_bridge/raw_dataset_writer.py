@@ -87,12 +87,22 @@ DMTAC_RAW_WRITER_PROFILE = RawDatasetWriterProfile(
 DMTAC_W_RAW_WRITER_PROFILE = RawDatasetWriterProfile(
     tactile_feature_description=(
         "uint8[] lossless packed DM-Tac W SDK 0.1.4 software sample in zarr; "
-        "contains raw image, deformation2d, normal, shear, and depth; source "
-        "dtypes, image shapes, byte offsets, and lengths are stored in tactile "
-        "metadata; the legacy SDK does not expose an atomic hardware frame id"
+        "schema 1/full contains raw image, deformation2d, normal, shear, and "
+        "depth; schema 3/shear_depth contains shear then depth; source dtypes, "
+        "image shapes, byte offsets, and lengths are stored in tactile metadata; "
+        "the legacy SDK does not expose an atomic hardware frame id"
     ),
     stream_tactile=True,
 )
+
+
+# Dataset schema 2 belongs to the newer DM-Tac SDK and intentionally is not
+# included here. These constants guard only the legacy DM-Tac W recorder when
+# its config exposes ``tactile_output_mode``.
+_DMTAC_W_FORMATS = {
+    "full": (1, 1_920_000),
+    "shear_depth": (3, 921_600),
+}
 
 
 class RawDatasetWriter:
@@ -149,12 +159,128 @@ class RawDatasetWriter:
         self._write_queue: queue.Queue[object] = queue.Queue(maxsize=queue_size)
         self._writer_thread: Optional[threading.Thread] = None
         self._writer_error: Optional[BaseException] = None
+        self._expected_dmtac_w_format = self._resolve_expected_dmtac_w_format()
+
+    def _resolve_expected_dmtac_w_format(self) -> Optional[tuple[str, int, int]]:
+        """Return configured legacy DM-Tac W mode/schema/bytes, if applicable."""
+        mode = getattr(self.cfg, "tactile_output_mode", None)
+        if mode is None:
+            return None
+        if str(self.cfg.tactile_msg_package) != "dmtac_tactile":
+            raise RuntimeError(
+                "tactile_output_mode is only valid with tactile_msg_package=dmtac_tactile"
+            )
+        mode = str(mode).strip().lower()
+        if mode not in _DMTAC_W_FORMATS:
+            raise RuntimeError(
+                f"unsupported DM-Tac W output mode {mode!r}; "
+                f"expected one of {sorted(_DMTAC_W_FORMATS)}"
+            )
+        mapped_schema, mapped_bytes = _DMTAC_W_FORMATS[mode]
+        schema = int(getattr(self.cfg, "tactile_schema_version", mapped_schema))
+        packed_bytes = int(getattr(self.cfg, "tactile_packed_frame_bytes", mapped_bytes))
+        if (schema, packed_bytes) != (mapped_schema, mapped_bytes):
+            raise RuntimeError(
+                "configured DM-Tac W mode/schema/size mismatch: "
+                f"mode={mode!r} requires schema={mapped_schema}, bytes={mapped_bytes}; "
+                f"got schema={schema}, bytes={packed_bytes}"
+            )
+        return mode, schema, packed_bytes
+
+    def _validate_existing_dmtac_w_format(self) -> None:
+        """Refuse to append a configured schema to a root containing another one."""
+        expected = self._expected_dmtac_w_format
+        if expected is None:
+            return
+        mode, schema, packed_bytes = expected
+
+        if self.info_path.exists():
+            try:
+                info = json.loads(self.info_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"cannot verify existing dataset metadata {self.info_path}: {exc}"
+                ) from exc
+            existing_package = info.get("tactile_msg_package")
+            if existing_package not in (None, "dmtac_tactile"):
+                raise RuntimeError(
+                    "dataset root already contains another tactile package: "
+                    f"existing={existing_package!r}, configured='dmtac_tactile'"
+                )
+            checks = (
+                ("tactile_output_mode", mode),
+                ("tactile_schema_version", schema),
+                ("tactile_packed_frame_bytes", packed_bytes),
+            )
+            for key, expected_value in checks:
+                existing_value = info.get(key)
+                if existing_value is not None and existing_value != expected_value:
+                    raise RuntimeError(
+                        "refusing to mix DM-Tac W formats in one dataset root: "
+                        f"meta/info.json {key}={existing_value!r}, "
+                        f"configured={expected_value!r}. Use a new empty dataset root."
+                    )
+
+        # Old schema-1 datasets predate the explicit info.json format fields,
+        # so the Zarr frame width is the authoritative compatibility check.
+        try:
+            import zarr
+        except ImportError as exc:
+            raise RuntimeError(
+                "zarr is required to verify an existing tactile dataset"
+            ) from exc
+        for side, zarr_path in (
+            ("left", self.tactile_left_zarr_path),
+            ("right", self.tactile_right_zarr_path),
+        ):
+            if not zarr_path.exists():
+                continue
+            arr = zarr.open(str(zarr_path), mode="r")
+            if len(arr.shape) != 2:
+                raise RuntimeError(
+                    f"existing DM-Tac W {side} zarr has invalid shape {tuple(arr.shape)}"
+                )
+            existing_bytes = int(arr.shape[1])
+            if existing_bytes != packed_bytes:
+                raise RuntimeError(
+                    "refusing to mix DM-Tac W formats in one dataset root: "
+                    f"existing {side} zarr frame bytes={existing_bytes}, "
+                    f"configured output_mode={mode!r}/schema={schema}/bytes={packed_bytes}. "
+                    "Use a new empty dataset root."
+                )
+
+    def _validate_dmtac_w_payload(self, payload: dict[str, Any]) -> None:
+        expected = self._expected_dmtac_w_format
+        if expected is None:
+            return
+        mode, schema, packed_bytes = expected
+        layout = payload.get("layout")
+        if not isinstance(layout, dict):
+            raise RuntimeError("DM-Tac W payload layout must be a mapping")
+        actual_schema = int(layout.get("schema_version", -1))
+        actual_packed_bytes = int(layout.get("packed_frame_bytes", -1))
+        actual_data_len = int(payload.get("data_len", -1))
+        actual_data_size = int(np.asarray(payload.get("data", ())).size)
+        if (
+            actual_schema != schema
+            or actual_packed_bytes != packed_bytes
+            or actual_data_len != packed_bytes
+            or actual_data_size != packed_bytes
+        ):
+            raise RuntimeError(
+                "DM-Tac W payload does not match configured format: "
+                f"configured mode={mode!r}/schema={schema}/bytes={packed_bytes}; "
+                f"payload schema={actual_schema}, packed_frame_bytes={actual_packed_bytes}, "
+                f"data_len={actual_data_len}, data_size={actual_data_size}"
+            )
 
     def prepare(self) -> None:
         try:
             import zarr  # noqa: F401
         except ImportError as e:
             raise RuntimeError("zarr is required to save tactile data. Install python package 'zarr'.") from e
+
+        self._validate_existing_dmtac_w_format()
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.episode_data_dir.mkdir(parents=True, exist_ok=True)
@@ -223,6 +349,15 @@ class RawDatasetWriter:
                 "sync.*": "diagnostics for nearest-neighbor alignment",
             },
         }
+        if self._expected_dmtac_w_format is not None:
+            mode, schema, packed_bytes = self._expected_dmtac_w_format
+            info.update(
+                {
+                    "tactile_output_mode": mode,
+                    "tactile_schema_version": schema,
+                    "tactile_packed_frame_bytes": packed_bytes,
+                }
+            )
         with open(self.info_path, "w", encoding="utf-8") as f:
             json.dump(info, f, ensure_ascii=False, indent=2)
         if self._async_frame_writes:
@@ -691,6 +826,7 @@ class RawDatasetWriter:
         sync_dt: float,
         zarr_path: Path,
     ) -> dict[str, Any]:
+        self._validate_dmtac_w_payload(payload)
         return {
             "episode_index": int(episode_index),
             "frame_index": int(frame_index),
@@ -856,6 +992,15 @@ class RawDatasetWriter:
             "task_index": int(self.cfg.task_index),
             "task_description": self.cfg.task_description,
         }
+        if self._expected_dmtac_w_format is not None:
+            mode, schema, packed_bytes = self._expected_dmtac_w_format
+            episode_info.update(
+                {
+                    "tactile_output_mode": mode,
+                    "tactile_schema_version": schema,
+                    "tactile_packed_frame_bytes": packed_bytes,
+                }
+            )
         with open(self.episodes_index_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(episode_info, ensure_ascii=False) + "\n")
 
