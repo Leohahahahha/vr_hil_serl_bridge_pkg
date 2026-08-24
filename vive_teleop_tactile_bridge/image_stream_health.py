@@ -16,6 +16,23 @@ def normalize_qos_reliability(value: Any, *, field_name: str) -> str:
     return reliability
 
 
+def normalize_image_message_type(value: Any, *, field_name: str) -> str:
+    message_type = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "image": "raw",
+        "raw": "raw",
+        "compressed": "compressed",
+        "compressedimage": "compressed",
+        "compressed_image": "compressed",
+    }
+    try:
+        return aliases[message_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"{field_name} must be 'raw' or 'compressed', got: {value!r}"
+        ) from exc
+
+
 class RemoteImageStampMonitor:
     """Validate a remote camera stamp and map it into local monotonic time.
 

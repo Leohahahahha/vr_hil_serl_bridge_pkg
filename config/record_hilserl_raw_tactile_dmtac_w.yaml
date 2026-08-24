@@ -25,11 +25,13 @@ server:
   state_poll_hz: 30.0
 
 image:
-  topic: "/zed/zed_node/rgb/color/rect/image"
+  topic: "/zed/zed_node/rgb/color/rect/image/compressed"
   name: "front"
-  # ZED runs on the Orin and publishes raw RGB at 30 Hz. Keep only the latest
-  # sample on the recorder so a temporary network/CPU stall cannot create a
-  # reliable backlog of old images.
+  # ZED runs on the Orin and publishes JPEG-compressed RGB at 30 Hz. The
+  # recorder keeps the original capture stamp and decodes only selected 10 Hz
+  # frames in the background writer. Set message_type="raw" and remove the
+  # /compressed suffix to use the legacy sensor_msgs/Image path.
+  message_type: "compressed"
   expected_hz: 30.0
   qos_reliability: "best_effort"
   qos_depth: 1

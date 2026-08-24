@@ -23,7 +23,7 @@ import yaml
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import Bool, Float32, String
 
 try:
@@ -36,7 +36,11 @@ try:
         packed_layout_metadata,
         schema_version_for_mode,
     )
-    from .image_stream_health import RemoteImageStampMonitor, normalize_qos_reliability
+    from .image_stream_health import (
+        RemoteImageStampMonitor,
+        normalize_image_message_type,
+        normalize_qos_reliability,
+    )
     from .raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter
     from .record_raw_hilserl_zed_tactile_paxini import (
         RawCollectionNode as CommonRawCollectionNode,
@@ -58,6 +62,7 @@ except ImportError:
     )
     from image_stream_health import (  # type: ignore
         RemoteImageStampMonitor,
+        normalize_image_message_type,
         normalize_qos_reliability,
     )
     from raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter  # type: ignore
@@ -123,6 +128,7 @@ class RecordConfig:
 
     image_topic: str
     image_name: str
+    image_message_type: str
     image_expected_hz: float
     image_qos_reliability: str
     image_qos_depth: int
@@ -209,6 +215,10 @@ def load_config(path: str | Path) -> RecordConfig:
         debug=bool(record.get("debug", False)),
         image_topic=str(image.get("topic", "/zed/zed_node/rgb/color/rect/image")),
         image_name=str(image.get("name", "front")),
+        image_message_type=normalize_image_message_type(
+            image.get("message_type", "raw"),
+            field_name="image.message_type",
+        ),
         image_expected_hz=max(0.0, float(image.get("expected_hz", 30.0))),
         image_qos_reliability=normalize_qos_reliability(
             image.get("qos_reliability", "best_effort"),
@@ -544,7 +554,13 @@ class RawCollectionNode(CommonRawCollectionNode):
             diagnostics_interval_sec=cfg.timestamp_diagnostics_interval_sec,
         )
 
-        self.create_subscription(Image, cfg.image_topic, self._image_cb, front_image_qos)
+        front_image_type = CompressedImage if cfg.image_message_type == "compressed" else Image
+        self.create_subscription(
+            front_image_type,
+            cfg.image_topic,
+            self._image_cb,
+            front_image_qos,
+        )
         self.create_subscription(Image, cfg.wrist_image_topic, self._wrist_image_cb, wrist_image_qos)
         self.create_subscription(
             CameraInfo, cfg.wrist_camera_info_topic, self._wrist_camera_info_cb, wrist_image_qos
@@ -569,6 +585,7 @@ class RawCollectionNode(CommonRawCollectionNode):
 
         self.get_logger().info(
             f"subscribe remote ZED image: {cfg.image_topic} "
+            f"message_type={cfg.image_message_type} "
             f"qos={cfg.image_qos_reliability}/depth{cfg.image_qos_depth} "
             f"expected_hz={cfg.image_expected_hz:.1f}"
         )
@@ -577,7 +594,7 @@ class RawCollectionNode(CommonRawCollectionNode):
             f"qos={cfg.wrist_image_qos_reliability}/depth{cfg.wrist_image_qos_depth}"
         )
 
-    def _image_cb(self, msg: Image) -> None:
+    def _image_cb(self, msg: Image | CompressedImage) -> None:
         receive_monotonic_ns = time.monotonic_ns()
         receive_wall_ns = time.time_ns()
         if self.cfg.use_image_header_stamp:
@@ -626,7 +643,7 @@ def main() -> None:
     print("====== [START] Raw HIL-SERL ZED legacy DM-Tac W recorder ======")
     print(f"[DATASET] root: {cfg.dataset_root}")
     print(f"[FPS] {cfg.fps}")
-    print(f"[IMAGE] {cfg.image_topic}")
+    print(f"[IMAGE] {cfg.image_topic} message_type={cfg.image_message_type}")
     print(f"[COMMAND] {cfg.command_event_topic}")
     print(f"[STATE] {cfg.robot_state_topic}")
     print(

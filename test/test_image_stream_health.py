@@ -6,6 +6,7 @@ from pathlib import Path
 
 from vive_teleop_tactile_bridge.image_stream_health import (
     RemoteImageStampMonitor,
+    normalize_image_message_type,
     normalize_qos_reliability,
 )
 
@@ -123,6 +124,18 @@ class RemoteImageStampMonitorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_qos_reliability("sometimes", field_name="image.qos")
 
+    def test_image_message_type_normalisation(self) -> None:
+        self.assertEqual(
+            normalize_image_message_type("CompressedImage", field_name="image.message_type"),
+            "compressed",
+        )
+        self.assertEqual(
+            normalize_image_message_type("image", field_name="image.message_type"),
+            "raw",
+        )
+        with self.assertRaises(ValueError):
+            normalize_image_message_type("theora", field_name="image.message_type")
+
 
 class RemoteZedConfigTest(unittest.TestCase):
     def test_recorder_uses_latest_only_remote_zed_qos(self) -> None:
@@ -131,6 +144,8 @@ class RemoteZedConfigTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('expected_hz: 30.0', text)
+        self.assertIn('message_type: "compressed"', text)
+        self.assertIn('/zed/zed_node/rgb/color/rect/image/compressed', text)
         self.assertIn('qos_reliability: "best_effort"', text)
         self.assertIn('qos_depth: 1', text)
         self.assertIn('reject_unsynced_remote_stamp: true', text)

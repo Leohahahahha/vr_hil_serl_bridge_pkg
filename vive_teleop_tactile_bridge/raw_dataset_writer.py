@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 import json
 import queue
 import shutil
@@ -11,7 +12,7 @@ from typing import Any, Optional, Protocol
 import numpy as np
 import pandas as pd
 from PIL import Image as PILImage
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 
 try:
     from .action_space import ACTION_NAMES, STATE_NAMES
@@ -44,7 +45,7 @@ class RawDatasetWriterProfile:
 
 @dataclass
 class _FrameWriteTask:
-    image_msg: Image
+    image_msg: Image | CompressedImage
     image_out_path: Path
     wrist_image_msg: Image
     wrist_image_out_path: Path
@@ -420,7 +421,14 @@ class RawDatasetWriter:
                 self._write_queue.task_done()
 
     @staticmethod
-    def _write_png(msg: Image, out_path: Path) -> None:
+    def _write_png(msg: Image | CompressedImage, out_path: Path) -> None:
+        if isinstance(msg, CompressedImage):
+            try:
+                with PILImage.open(BytesIO(bytes(msg.data))) as encoded_image:
+                    encoded_image.convert("RGB").save(str(out_path), format="PNG")
+            except Exception as exc:
+                raise RuntimeError(f"failed to decode/write compressed PNG: {out_path}") from exc
+            return
         rgb = image_msg_to_rgb8(msg)
         try:
             PILImage.fromarray(rgb, mode="RGB").save(str(out_path))
@@ -572,22 +580,37 @@ class RawDatasetWriter:
         *,
         episode_index: int,
         frame_index: int,
-        msg: Image,
+        msg: Image | CompressedImage,
         out_path: Path,
         rel_path: Path,
         topic: str,
     ) -> dict[str, Any]:
         stamp = msg.header.stamp
+        if isinstance(msg, CompressedImage):
+            try:
+                with PILImage.open(BytesIO(bytes(msg.data))) as encoded_image:
+                    width, height = encoded_image.size
+            except Exception as exc:
+                raise ValueError(
+                    f"failed to read compressed image metadata: {msg.format!r}"
+                ) from exc
+            source_encoding = f"compressed:{msg.format}"
+            step = int(width) * 3
+        else:
+            height = int(msg.height)
+            width = int(msg.width)
+            source_encoding = str(msg.encoding)
+            step = int(msg.step)
         return {
             "episode_index": int(episode_index),
             "record_frame_index": int(frame_index),
             "path": str(rel_path),
             "tmp_path": str(out_path.relative_to(self.root)),
-            "height": int(msg.height),
-            "width": int(msg.width),
+            "height": int(height),
+            "width": int(width),
             "encoding": "rgb8",
-            "source_encoding": str(msg.encoding),
-            "step": int(msg.step),
+            "source_encoding": source_encoding,
+            "step": step,
             "ros_stamp_sec": int(stamp.sec),
             "ros_stamp_nanosec": int(stamp.nanosec),
             "ros_stamp_float": ros_stamp_to_float_sec(stamp),
@@ -600,7 +623,7 @@ class RawDatasetWriter:
         *,
         episode_index: int,
         frame_index: int,
-        msg: Image,
+        msg: Image | CompressedImage,
         tmp_dir: Path,
         rel_path: Path,
         topic: str,
@@ -619,7 +642,12 @@ class RawDatasetWriter:
         records.append(rec)
         return str(rel_path), rec
 
-    def save_image(self, episode_index: int, frame_index: int, msg: Image) -> tuple[str, dict[str, Any]]:
+    def save_image(
+        self,
+        episode_index: int,
+        frame_index: int,
+        msg: Image | CompressedImage,
+    ) -> tuple[str, dict[str, Any]]:
         if self.current_tmp_image_dir is None:
             raise RuntimeError("start_episode must be called before save_image")
         return self._save_image_to_dir(
@@ -716,7 +744,7 @@ class RawDatasetWriter:
         frame_index: int,
         timestamp: float,
         wall_time: float,
-        image_msg: Image,
+        image_msg: Image | CompressedImage,
         wrist_image_msg: Image,
         left_payload: dict[str, Any],
         left_dt: float,
