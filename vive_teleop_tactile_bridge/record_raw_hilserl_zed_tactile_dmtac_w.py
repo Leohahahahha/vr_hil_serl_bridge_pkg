@@ -36,6 +36,7 @@ try:
         packed_layout_metadata,
         schema_version_for_mode,
     )
+    from .image_stream_health import RemoteImageStampMonitor, normalize_qos_reliability
     from .raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter
     from .record_raw_hilserl_zed_tactile_paxini import (
         RawCollectionNode as CommonRawCollectionNode,
@@ -54,6 +55,10 @@ except ImportError:
         normalize_output_mode,
         packed_layout_metadata,
         schema_version_for_mode,
+    )
+    from image_stream_health import (  # type: ignore
+        RemoteImageStampMonitor,
+        normalize_qos_reliability,
     )
     from raw_dataset_writer import DMTAC_W_RAW_WRITER_PROFILE, RawDatasetWriter  # type: ignore
     from record_raw_hilserl_zed_tactile_paxini import (  # type: ignore
@@ -91,6 +96,19 @@ DMTAC_IMAGE_SPECS = {
 DMTAC_FRAME_PARTS = tuple(DMTAC_IMAGE_SPECS)
 
 
+def _image_qos_profile(reliability: str, depth: int) -> QoSProfile:
+    policy = (
+        ReliabilityPolicy.RELIABLE
+        if reliability == "reliable"
+        else ReliabilityPolicy.BEST_EFFORT
+    )
+    return QoSProfile(
+        reliability=policy,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=max(1, int(depth)),
+    )
+
+
 @dataclass
 class RecordConfig:
     dataset_root: Path
@@ -105,9 +123,14 @@ class RecordConfig:
 
     image_topic: str
     image_name: str
+    image_expected_hz: float
+    image_qos_reliability: str
+    image_qos_depth: int
     wrist_image_topic: str
     wrist_camera_info_topic: str
     wrist_image_name: str
+    wrist_image_qos_reliability: str
+    wrist_image_qos_depth: int
 
     raw_vr_target_pose_topic: str
     enabled_topic: str
@@ -129,6 +152,10 @@ class RecordConfig:
     max_tactile_dt_sec: float
     sync_lag_sec: float
     use_image_header_stamp: bool
+    max_remote_image_transport_sec: float
+    max_remote_image_future_sec: float
+    reject_unsynced_remote_stamp: bool
+    timestamp_diagnostics_interval_sec: float
 
     save_master_parquet_every_episode: bool
     save_debug_jsonl: bool
@@ -182,11 +209,22 @@ def load_config(path: str | Path) -> RecordConfig:
         debug=bool(record.get("debug", False)),
         image_topic=str(image.get("topic", "/zed/zed_node/rgb/color/rect/image")),
         image_name=str(image.get("name", "front")),
+        image_expected_hz=max(0.0, float(image.get("expected_hz", 30.0))),
+        image_qos_reliability=normalize_qos_reliability(
+            image.get("qos_reliability", "best_effort"),
+            field_name="image.qos_reliability",
+        ),
+        image_qos_depth=max(1, int(image.get("qos_depth", 1))),
         wrist_image_topic=str(wrist_image.get("topic", "/camera/d405/color/image_raw")),
         wrist_camera_info_topic=str(
             wrist_image.get("camera_info_topic", "/camera/d405/color/camera_info")
         ),
         wrist_image_name=str(wrist_image.get("name", "wrist")),
+        wrist_image_qos_reliability=normalize_qos_reliability(
+            wrist_image.get("qos_reliability", "reliable"),
+            field_name="wrist_image.qos_reliability",
+        ),
+        wrist_image_qos_depth=max(1, int(wrist_image.get("qos_depth", 5))),
         raw_vr_target_pose_topic=str(vr.get("target_pose_topic", "/vr_bridge/target_pose")),
         enabled_topic=str(vr.get("enabled_topic", "/vr_bridge/enabled")),
         joystick_y_topic=str(vr.get("joystick_y_topic", "/vr/right_controller/joystick_y")),
@@ -206,6 +244,16 @@ def load_config(path: str | Path) -> RecordConfig:
         max_tactile_dt_sec=float(sync.get("max_tactile_dt_sec", 0.15)),
         sync_lag_sec=max(0.0, float(sync.get("sync_lag_sec", 0.25))),
         use_image_header_stamp=bool(sync.get("use_image_header_stamp", True)),
+        max_remote_image_transport_sec=max(
+            0.0, float(sync.get("max_remote_image_transport_sec", 0.20))
+        ),
+        max_remote_image_future_sec=max(
+            0.0, float(sync.get("max_remote_image_future_sec", 0.05))
+        ),
+        reject_unsynced_remote_stamp=bool(sync.get("reject_unsynced_remote_stamp", True)),
+        timestamp_diagnostics_interval_sec=max(
+            1.0, float(sync.get("timestamp_diagnostics_interval_sec", 5.0))
+        ),
         save_master_parquet_every_episode=bool(
             output.get("save_master_parquet_every_episode", True)
         ),
@@ -462,10 +510,13 @@ class RawCollectionNode(CommonRawCollectionNode):
         self.tactile_left_buffer = TimedBuffer(maxlen=64)
         self.tactile_right_buffer = TimedBuffer(maxlen=64)
 
-        image_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5,
+        front_image_qos = _image_qos_profile(
+            cfg.image_qos_reliability,
+            cfg.image_qos_depth,
+        )
+        wrist_image_qos = _image_qos_profile(
+            cfg.wrist_image_qos_reliability,
+            cfg.wrist_image_qos_depth,
         )
         fast_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -483,10 +534,20 @@ class RawCollectionNode(CommonRawCollectionNode):
             depth=100,
         )
 
-        self.create_subscription(Image, cfg.image_topic, self._image_cb, image_qos)
-        self.create_subscription(Image, cfg.wrist_image_topic, self._wrist_image_cb, image_qos)
+        self._front_image_stamp_monitor = RemoteImageStampMonitor(
+            logger=self.get_logger(),
+            stream_name="front_zed_remote",
+            expected_hz=cfg.image_expected_hz,
+            max_apparent_age_sec=cfg.max_remote_image_transport_sec,
+            max_future_sec=cfg.max_remote_image_future_sec,
+            reject_invalid=cfg.reject_unsynced_remote_stamp,
+            diagnostics_interval_sec=cfg.timestamp_diagnostics_interval_sec,
+        )
+
+        self.create_subscription(Image, cfg.image_topic, self._image_cb, front_image_qos)
+        self.create_subscription(Image, cfg.wrist_image_topic, self._wrist_image_cb, wrist_image_qos)
         self.create_subscription(
-            CameraInfo, cfg.wrist_camera_info_topic, self._wrist_camera_info_cb, image_qos
+            CameraInfo, cfg.wrist_camera_info_topic, self._wrist_camera_info_cb, wrist_image_qos
         )
         self.create_subscription(String, cfg.command_event_topic, self._command_event_cb, log_qos)
         self.create_subscription(String, cfg.robot_state_topic, self._robot_state_cb, log_qos)
@@ -505,6 +566,32 @@ class RawCollectionNode(CommonRawCollectionNode):
                 packed_tactile_qos,
             )
             self.get_logger().info(f"subscribe DM-Tac {side} packed frame: {topic}")
+
+        self.get_logger().info(
+            f"subscribe remote ZED image: {cfg.image_topic} "
+            f"qos={cfg.image_qos_reliability}/depth{cfg.image_qos_depth} "
+            f"expected_hz={cfg.image_expected_hz:.1f}"
+        )
+        self.get_logger().info(
+            f"subscribe local wrist image: {cfg.wrist_image_topic} "
+            f"qos={cfg.wrist_image_qos_reliability}/depth{cfg.wrist_image_qos_depth}"
+        )
+
+    def _image_cb(self, msg: Image) -> None:
+        receive_monotonic_ns = time.monotonic_ns()
+        receive_wall_ns = time.time_ns()
+        if self.cfg.use_image_header_stamp:
+            sample_t = self._front_image_stamp_monitor.map_stamp(
+                msg.header.stamp,
+                receive_wall_ns=receive_wall_ns,
+                receive_monotonic_ns=receive_monotonic_ns,
+            )
+            if sample_t is None:
+                return
+        else:
+            sample_t = receive_monotonic_ns * 1e-9
+        with self._lock:
+            self.image_buffer.append(sample_t, msg)
 
     def _dmtac_packed_cb(self, side: str, sensor_index: int, msg: Image) -> None:
         receive_monotonic_ns = time.monotonic_ns()
@@ -549,6 +636,15 @@ def main() -> None:
     )
     print(
         f"[SYNC] lag={cfg.sync_lag_sec:.3f}s image_header_stamp={cfg.use_image_header_stamp}"
+    )
+    print(
+        f"[IMAGE_QOS] front={cfg.image_qos_reliability}/depth{cfg.image_qos_depth} "
+        f"wrist={cfg.wrist_image_qos_reliability}/depth{cfg.wrist_image_qos_depth}"
+    )
+    print(
+        f"[REMOTE_STAMP] max_age={cfg.max_remote_image_transport_sec:.3f}s "
+        f"max_future={cfg.max_remote_image_future_sec:.3f}s "
+        f"reject_invalid={cfg.reject_unsynced_remote_stamp}"
     )
     print(
         f"[WRITER] queue={cfg.write_queue_size} tasks "

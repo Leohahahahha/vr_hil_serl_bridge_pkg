@@ -136,6 +136,8 @@ def check_raw_dataset(root: Path, sample_images: int, report: Reporter) -> None:
     _check_vectors(df, report)
     _print_sync_stats(df)
     _print_http_stats(df)
+    _check_image_timestamps(df, "image", info, report)
+    _check_image_timestamps(df, "wrist_image", info, report)
     _check_episode_files(root, df, report)
     _check_images(root, df, "image", "image.path", sample_images, report)
     _check_images(root, df, "wrist_image", "wrist_image.path", sample_images, report)
@@ -237,6 +239,92 @@ def _print_http_stats(df: pd.DataFrame) -> None:
     if "sync.valid" in df.columns:
         valid_rate = float(df["sync.valid"].astype(bool).mean())
         print(f"sync.valid rate: {valid_rate:.3f}")
+
+
+def _check_image_timestamps(
+    df: pd.DataFrame,
+    prefix: str,
+    info: dict[str, Any],
+    report: Reporter,
+) -> None:
+    stamp_column = f"{prefix}.ros_stamp_float"
+    if stamp_column not in df.columns:
+        report.warn(f"{prefix}: missing {stamp_column}; timestamp continuity was not checked")
+        return
+
+    try:
+        record_fps = float(info.get("fps", 0.0))
+    except (TypeError, ValueError):
+        record_fps = 0.0
+    gap_warn_sec = max(0.25, 2.5 / record_fps) if record_fps > 0.0 else 0.25
+
+    if "episode_index" in df.columns:
+        episode_groups = df.groupby("episode_index", sort=True)
+    else:
+        episode_groups = [(0, df)]
+
+    total_rows = 0
+    total_unique = 0
+    total_duplicates = 0
+    total_backwards = 0
+    all_positive_diffs: list[np.ndarray] = []
+    gap_examples: list[tuple[int, int, float]] = []
+
+    for episode_index, sub in episode_groups:
+        stamps = pd.to_numeric(sub[stamp_column], errors="coerce").to_numpy(dtype=float)
+        finite = np.isfinite(stamps)
+        if not finite.all():
+            report.error(
+                f"{prefix}: episode {int(episode_index)} has "
+                f"{int((~finite).sum())} invalid ROS image stamps"
+            )
+            stamps = stamps[finite]
+        if stamps.size == 0:
+            continue
+
+        total_rows += int(stamps.size)
+        total_unique += int(np.unique(stamps).size)
+        if stamps.size < 2:
+            continue
+
+        diffs = np.diff(stamps)
+        duplicate_indices = np.flatnonzero(diffs == 0.0)
+        backwards_indices = np.flatnonzero(diffs < 0.0)
+        positive_diffs = diffs[diffs > 0.0]
+        total_duplicates += int(duplicate_indices.size)
+        total_backwards += int(backwards_indices.size)
+        if positive_diffs.size:
+            all_positive_diffs.append(positive_diffs)
+            for local_index in np.flatnonzero(diffs > gap_warn_sec)[:3]:
+                gap_examples.append(
+                    (int(episode_index), int(local_index + 1), float(diffs[local_index]))
+                )
+
+    print(
+        f"{prefix} timestamps: rows={total_rows}, unique={total_unique}, "
+        f"duplicate_steps={total_duplicates}, backwards_steps={total_backwards}"
+    )
+    if all_positive_diffs:
+        positive = np.concatenate(all_positive_diffs)
+        median_dt = float(np.median(positive))
+        estimated_hz = 1.0 / median_dt if median_dt > 0.0 else 0.0
+        print(
+            f"  positive_dt_sec: median={median_dt:.4f}, "
+            f"p95={np.percentile(positive, 95):.4f}, max={np.max(positive):.4f}, "
+            f"estimated_saved_hz={estimated_hz:.2f}"
+        )
+
+    if total_duplicates:
+        report.error(f"{prefix}: {total_duplicates} adjacent rows reuse the same ROS image stamp")
+    if total_backwards:
+        report.error(f"{prefix}: {total_backwards} adjacent ROS image stamps move backwards")
+    if gap_examples:
+        example_text = ", ".join(
+            f"episode={ep}/row={row}/dt={dt:.3f}s" for ep, row, dt in gap_examples[:3]
+        )
+        report.warn(
+            f"{prefix}: image stamp gaps exceed {gap_warn_sec:.3f}s; examples: {example_text}"
+        )
 
 
 def _check_episode_files(root: Path, df: pd.DataFrame, report: Reporter) -> None:

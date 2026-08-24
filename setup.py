@@ -22,6 +22,7 @@ setup(
             'config/record_hilserl_raw_tactile_dmtac_w.yaml',
             'config/record_hilserl_raw_tactile_paxini.yaml',
             'config/record_hilserl_raw_tactile_tashan.yaml',
+            'config/zed_orin_rgb_30hz.yaml',
         ]),
         (f'share/{package_name}/scripts', [
             'vive_teleop_tactile_bridge/dmtac_w_ipc.py',

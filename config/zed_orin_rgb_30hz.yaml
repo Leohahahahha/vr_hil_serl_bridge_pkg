@@ -1,0 +1,38 @@
+/**:
+  ros__parameters:
+    general:
+      # Capture at the native 30 Hz cadence and publish 960x540 BGR at 30 Hz.
+      grab_resolution: 'HD1080'
+      grab_frame_rate: 30
+      pub_resolution: 'CUSTOM'
+      pub_downscale_factor: 2.0
+      pub_frame_rate: 30.0
+
+    video:
+      enable_24bit_output: true
+      publish_rgb: true
+      publish_left_right: false
+      publish_raw: false
+      publish_gray: false
+      publish_stereo: false
+
+    # The recorder consumes only /zed/zed_node/rgb/color/rect/image. Disable
+    # GPU-heavy outputs that are not part of the training observation.
+    depth:
+      depth_mode: 'NONE'
+      depth_stabilization: 0
+      publish_depth_map: false
+      publish_depth_info: false
+      publish_point_cloud: false
+      publish_depth_confidence: false
+      publish_disparity: false
+
+    pos_tracking:
+      pos_tracking_enabled: false
+      publish_tf: false
+      publish_map_tf: false
+
+    sensors:
+      publish_imu: false
+      publish_imu_raw: false
+      publish_imu_tf: false
