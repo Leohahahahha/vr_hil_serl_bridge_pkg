@@ -5,6 +5,7 @@ import json
 import queue
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -160,7 +161,33 @@ class RawDatasetWriter:
         self._write_queue: queue.Queue[object] = queue.Queue(maxsize=queue_size)
         self._writer_thread: Optional[threading.Thread] = None
         self._writer_error: Optional[BaseException] = None
+        self._preserve_compressed_images = bool(
+            getattr(cfg, "preserve_compressed_images", False)
+        )
+        self._png_compress_level = min(
+            9, max(0, int(getattr(cfg, "png_compress_level", 1)))
+        )
+        self._writer_diagnostics_interval_sec = max(
+            1.0, float(getattr(cfg, "writer_diagnostics_interval_sec", 5.0))
+        )
+        self._writer_stats_lock = threading.Lock()
+        self._reset_writer_stats()
         self._expected_dmtac_w_format = self._resolve_expected_dmtac_w_format()
+
+    def _reset_writer_stats(self) -> None:
+        with self._writer_stats_lock:
+            self._writer_stats_started = time.perf_counter()
+            self._writer_frames = 0
+            self._writer_first_task_started: Optional[float] = None
+            self._writer_last_task_finished: Optional[float] = None
+            self._writer_front_sec = 0.0
+            self._writer_wrist_sec = 0.0
+            self._writer_tactile_sec = 0.0
+            self._writer_enqueue_wait_sec = 0.0
+            self._writer_enqueue_wait_max_sec = 0.0
+            self._writer_blocked_enqueues = 0
+            self._writer_max_queue = 0
+            self._writer_last_diagnostic = self._writer_stats_started
 
     def _resolve_expected_dmtac_w_format(self) -> Optional[tuple[str, int, int]]:
         """Return configured legacy DM-Tac W mode/schema/bytes, if applicable."""
@@ -298,7 +325,8 @@ class RawDatasetWriter:
         info = {
             "dataset_type": "fr3_zed_d405_rgb_hilserl_raw_sidecar",
             "description": (
-                "Raw ZED front RGB PNG + D405 wrist RGB PNG images + HIL-SERL sent command "
+                "Raw ZED front RGB source-compressed images + D405 wrist RGB PNG images "
+                "+ HIL-SERL sent command "
                 "+ franka_server robot state. Convert this raw dataset to SDP HDF5 before training."
             ),
             "fps": self.cfg.fps,
@@ -341,7 +369,10 @@ class RawDatasetWriter:
                 "action.http_route": "string, HTTP route used by the command event, e.g. /pose or /move_gripper",
                 "robot.ee_pose": "float32[7], absolute current end-effector pose parsed from /getstate",
                 "robot.gripper_pos": "float, current gripper width parsed from /getstate",
-                "image.path": "relative path to ZED front RGB PNG sidecar",
+                "image.path": (
+                    "relative path to ZED front RGB sidecar; source JPEG is retained "
+                    "when configured"
+                ),
                 "wrist_image.path": "relative path to D405 wrist RGB PNG sidecar",
                 "tactile.*.zarr_index": "row index into tactile/tactile_left|right/data.zarr",
                 "tactile.*.data": self.profile.tactile_feature_description,
@@ -380,12 +411,26 @@ class RawDatasetWriter:
 
     def _enqueue_write(self, task: object) -> None:
         self._raise_writer_error()
+        wait_started = time.perf_counter()
+        blocked = False
         while True:
             try:
                 self._write_queue.put(task, timeout=0.1)
-                return
+                break
             except queue.Full:
+                blocked = True
                 self._raise_writer_error()
+        wait_sec = time.perf_counter() - wait_started
+        with self._writer_stats_lock:
+            self._writer_enqueue_wait_sec += wait_sec
+            self._writer_enqueue_wait_max_sec = max(
+                self._writer_enqueue_wait_max_sec, wait_sec
+            )
+            if blocked:
+                self._writer_blocked_enqueues += 1
+            self._writer_max_queue = max(
+                self._writer_max_queue, int(self._write_queue.qsize())
+            )
 
     def _background_writer_loop(self) -> None:
         tactile_batch: list[_FrameWriteTask] = []
@@ -399,20 +444,33 @@ class RawDatasetWriter:
                         return
                     continue
                 if task is _STOP_WRITER:
-                    self._flush_tactile_task_batch(tactile_batch)
+                    self._timed_flush_tactile_task_batch(tactile_batch)
                     return
                 if isinstance(task, _FlushWriteTask):
-                    self._flush_tactile_task_batch(tactile_batch)
+                    self._timed_flush_tactile_task_batch(tactile_batch)
                     task.completed.set()
                     continue
                 if not isinstance(task, _FrameWriteTask):
                     raise TypeError(f"unsupported writer task: {type(task)!r}")
 
-                self._write_png(task.image_msg, task.image_out_path)
-                self._write_png(task.wrist_image_msg, task.wrist_image_out_path)
+                task_started = time.perf_counter()
+                started = task_started
+                self._write_image(task.image_msg, task.image_out_path)
+                front_sec = time.perf_counter() - started
+                started = time.perf_counter()
+                self._write_image(task.wrist_image_msg, task.wrist_image_out_path)
+                wrist_sec = time.perf_counter() - started
+                with self._writer_stats_lock:
+                    if self._writer_first_task_started is None:
+                        self._writer_first_task_started = task_started
+                    self._writer_last_task_finished = time.perf_counter()
+                    self._writer_frames += 1
+                    self._writer_front_sec += front_sec
+                    self._writer_wrist_sec += wrist_sec
+                self._maybe_print_writer_diagnostics()
                 tactile_batch.append(task)
                 if len(tactile_batch) >= self._tactile_batch_frames:
-                    self._flush_tactile_task_batch(tactile_batch)
+                    self._timed_flush_tactile_task_batch(tactile_batch)
             except BaseException as exc:
                 self._writer_error = exc
                 if isinstance(task, _FlushWriteTask):
@@ -421,17 +479,45 @@ class RawDatasetWriter:
                 self._write_queue.task_done()
 
     @staticmethod
-    def _write_png(msg: Image | CompressedImage, out_path: Path) -> None:
+    def _compressed_extension(msg: CompressedImage) -> Optional[str]:
+        image_format = str(msg.format).lower()
+        if "jpeg" in image_format or "jpg" in image_format:
+            return ".jpg"
+        if "png" in image_format:
+            return ".png"
+        return None
+
+    def _image_extension(self, msg: Image | CompressedImage) -> str:
+        if isinstance(msg, CompressedImage) and self._preserve_compressed_images:
+            return self._compressed_extension(msg) or ".png"
+        return ".png"
+
+    def _write_image(self, msg: Image | CompressedImage, out_path: Path) -> None:
         if isinstance(msg, CompressedImage):
+            extension = self._compressed_extension(msg)
+            if self._preserve_compressed_images and extension is not None:
+                try:
+                    out_path.write_bytes(bytes(msg.data))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"failed to write source compressed image: {out_path}"
+                    ) from exc
+                return
             try:
                 with PILImage.open(BytesIO(bytes(msg.data))) as encoded_image:
-                    encoded_image.convert("RGB").save(str(out_path), format="PNG")
+                    encoded_image.convert("RGB").save(
+                        str(out_path),
+                        format="PNG",
+                        compress_level=self._png_compress_level,
+                    )
             except Exception as exc:
                 raise RuntimeError(f"failed to decode/write compressed PNG: {out_path}") from exc
             return
         rgb = image_msg_to_rgb8(msg)
         try:
-            PILImage.fromarray(rgb, mode="RGB").save(str(out_path))
+            PILImage.fromarray(rgb, mode="RGB").save(
+                str(out_path), format="PNG", compress_level=self._png_compress_level
+            )
         except Exception as exc:
             raise RuntimeError(f"failed to write PNG: {out_path}") from exc
 
@@ -467,8 +553,54 @@ class RawDatasetWriter:
                     record.pop("data", None)
             tasks.clear()
 
+    def _timed_flush_tactile_task_batch(self, tasks: list[_FrameWriteTask]) -> None:
+        if not tasks:
+            return
+        started = time.perf_counter()
+        self._flush_tactile_task_batch(tasks)
+        with self._writer_stats_lock:
+            self._writer_tactile_sec += time.perf_counter() - started
+            # At a batch boundary this is the true completion time of the
+            # latest frame, including both image files and tactile Zarr data.
+            self._writer_last_task_finished = time.perf_counter()
+
     def pending_write_tasks(self) -> int:
         return int(self._write_queue.qsize()) if self._async_frame_writes else 0
+
+    def performance_text(self) -> str:
+        with self._writer_stats_lock:
+            frames = int(self._writer_frames)
+            denominator = max(1, frames)
+            if (
+                self._writer_first_task_started is not None
+                and self._writer_last_task_finished is not None
+            ):
+                active_elapsed = max(
+                    1e-9,
+                    self._writer_last_task_finished - self._writer_first_task_started,
+                )
+            else:
+                active_elapsed = max(
+                    1e-9, time.perf_counter() - self._writer_stats_started
+                )
+            return (
+                f"processed={frames} processed_hz={frames / active_elapsed:.2f} "
+                f"front_ms={1000.0 * self._writer_front_sec / denominator:.1f} "
+                f"wrist_ms={1000.0 * self._writer_wrist_sec / denominator:.1f} "
+                f"tactile_ms_per_frame={1000.0 * self._writer_tactile_sec / denominator:.1f} "
+                f"enqueue_wait_ms={1000.0 * self._writer_enqueue_wait_sec:.1f} "
+                f"enqueue_wait_max_ms={1000.0 * self._writer_enqueue_wait_max_sec:.1f} "
+                f"blocked_enqueues={self._writer_blocked_enqueues} "
+                f"max_queue={self._writer_max_queue} pending={self.pending_write_tasks()}"
+            )
+
+    def _maybe_print_writer_diagnostics(self) -> None:
+        now = time.perf_counter()
+        with self._writer_stats_lock:
+            if now - self._writer_last_diagnostic < self._writer_diagnostics_interval_sec:
+                return
+            self._writer_last_diagnostic = now
+        print(f"[WRITER_PERF] {self.performance_text()}", flush=True)
 
     def flush_pending_writes(self) -> None:
         if not self._async_frame_writes:
@@ -505,6 +637,7 @@ class RawDatasetWriter:
 
     def start_episode(self, episode_index: int) -> None:
         self.flush_pending_writes()
+        self._reset_writer_stats()
         self.current_episode_rows = []
         self.current_image_records = []
         self.current_wrist_image_records = []
@@ -569,8 +702,15 @@ class RawDatasetWriter:
             )
         arr.resize((int(row_count), int(arr.shape[1])))
 
-    def _final_image_rel_path(self, episode_index: int, frame_index: int) -> Path:
-        return Path("image") / self.cfg.image_name / f"episode_{episode_index:06d}" / f"frame_{frame_index:06d}.png"
+    def _final_image_rel_path(
+        self, episode_index: int, frame_index: int, suffix: str = ".png"
+    ) -> Path:
+        return (
+            Path("image")
+            / self.cfg.image_name
+            / f"episode_{episode_index:06d}"
+            / f"frame_{frame_index:06d}{suffix}"
+        )
 
     def _final_wrist_image_rel_path(self, episode_index: int, frame_index: int) -> Path:
         return Path("image") / self.cfg.wrist_image_name / f"episode_{episode_index:06d}" / f"frame_{frame_index:06d}.png"
@@ -610,6 +750,7 @@ class RawDatasetWriter:
             "width": int(width),
             "encoding": "rgb8",
             "source_encoding": source_encoding,
+            "storage_encoding": rel_path.suffix.lstrip(".").lower(),
             "step": step,
             "ros_stamp_sec": int(stamp.sec),
             "ros_stamp_nanosec": int(stamp.nanosec),
@@ -629,8 +770,8 @@ class RawDatasetWriter:
         topic: str,
         records: list[dict[str, Any]],
     ) -> tuple[str, dict[str, Any]]:
-        out_path = tmp_dir / f"frame_{frame_index:06d}.png"
-        self._write_png(msg, out_path)
+        out_path = tmp_dir / f"frame_{frame_index:06d}{rel_path.suffix}"
+        self._write_image(msg, out_path)
         rec = self._make_image_record(
             episode_index=episode_index,
             frame_index=frame_index,
@@ -655,7 +796,9 @@ class RawDatasetWriter:
             frame_index=frame_index,
             msg=msg,
             tmp_dir=self.current_tmp_image_dir,
-            rel_path=self._final_image_rel_path(episode_index, frame_index),
+            rel_path=self._final_image_rel_path(
+                episode_index, frame_index, self._image_extension(msg)
+            ),
             topic=self.cfg.image_topic,
             records=self.current_image_records,
         )
@@ -781,9 +924,12 @@ class RawDatasetWriter:
         if self.current_tmp_image_dir is None or self.current_tmp_wrist_image_dir is None:
             raise RuntimeError("start_episode must be called before write_frame_assets")
 
-        image_rel = self._final_image_rel_path(episode_index, frame_index)
+        image_suffix = self._image_extension(image_msg)
+        image_rel = self._final_image_rel_path(
+            episode_index, frame_index, image_suffix
+        )
         wrist_rel = self._final_wrist_image_rel_path(episode_index, frame_index)
-        image_out = self.current_tmp_image_dir / f"frame_{frame_index:06d}.png"
+        image_out = self.current_tmp_image_dir / f"frame_{frame_index:06d}{image_suffix}"
         wrist_out = self.current_tmp_wrist_image_dir / f"frame_{frame_index:06d}.png"
         image_rec = self._make_image_record(
             episode_index=episode_index,

@@ -149,6 +149,11 @@ class RemoteZedConfigTest(unittest.TestCase):
         self.assertIn('qos_reliability: "best_effort"', text)
         self.assertIn('qos_depth: 1', text)
         self.assertIn('reject_unsynced_remote_stamp: true', text)
+        self.assertIn('executor_threads: 4', text)
+        self.assertIn('buffer_history_sec: 5.0', text)
+        self.assertIn('require_unique_image_stamps: true', text)
+        self.assertIn('preserve_compressed_images: true', text)
+        self.assertIn('png_compress_level: 1', text)
 
     def test_orin_profile_is_rgb_only_at_30_hz(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]

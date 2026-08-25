@@ -11,6 +11,7 @@ expose a hardware frame id or an atomic snapshot API.
 from __future__ import annotations
 
 import argparse
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ import numpy as np
 import rclpy
 import yaml
 from geometry_msgs.msg import PoseStamped
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
@@ -125,6 +128,8 @@ class RecordConfig:
     task_index: int
     wait_for_motion_enable_to_record: bool
     debug: bool
+    executor_threads: int
+    buffer_history_sec: float
 
     image_topic: str
     image_name: str
@@ -135,6 +140,7 @@ class RecordConfig:
     wrist_image_topic: str
     wrist_camera_info_topic: str
     wrist_image_name: str
+    wrist_image_expected_hz: float
     wrist_image_qos_reliability: str
     wrist_image_qos_depth: int
 
@@ -149,6 +155,7 @@ class RecordConfig:
     tactile_packed_frame_bytes: int
     tactile_left_packed_topic: str
     tactile_right_packed_topic: str
+    tactile_expected_hz: float
 
     max_image_dt_sec: float
     max_wrist_image_dt_sec: float
@@ -162,11 +169,15 @@ class RecordConfig:
     max_remote_image_future_sec: float
     reject_unsynced_remote_stamp: bool
     timestamp_diagnostics_interval_sec: float
+    require_unique_image_stamps: bool
 
     save_master_parquet_every_episode: bool
     save_debug_jsonl: bool
     write_queue_size: int
     tactile_batch_frames: int
+    preserve_compressed_images: bool
+    png_compress_level: int
+    writer_diagnostics_interval_sec: float
 
 
 def _side_packed_topic(tactile: dict[str, Any], side: str, base_topic: str) -> str:
@@ -213,6 +224,8 @@ def load_config(path: str | Path) -> RecordConfig:
         task_index=int(record.get("task_index", 0)),
         wait_for_motion_enable_to_record=bool(record.get("wait_for_motion_enable_to_record", False)),
         debug=bool(record.get("debug", False)),
+        executor_threads=max(2, int(record.get("executor_threads", 4))),
+        buffer_history_sec=max(1.0, float(record.get("buffer_history_sec", 5.0))),
         image_topic=str(image.get("topic", "/zed/zed_node/rgb/color/rect/image")),
         image_name=str(image.get("name", "front")),
         image_message_type=normalize_image_message_type(
@@ -230,6 +243,7 @@ def load_config(path: str | Path) -> RecordConfig:
             wrist_image.get("camera_info_topic", "/camera/d405/color/camera_info")
         ),
         wrist_image_name=str(wrist_image.get("name", "wrist")),
+        wrist_image_expected_hz=max(0.0, float(wrist_image.get("expected_hz", 30.0))),
         wrist_image_qos_reliability=normalize_qos_reliability(
             wrist_image.get("qos_reliability", "reliable"),
             field_name="wrist_image.qos_reliability",
@@ -246,6 +260,7 @@ def load_config(path: str | Path) -> RecordConfig:
         tactile_packed_frame_bytes=tactile_packed_frame_bytes,
         tactile_left_packed_topic=_side_packed_topic(tactile, "left", base_topic),
         tactile_right_packed_topic=_side_packed_topic(tactile, "right", base_topic),
+        tactile_expected_hz=max(0.0, float(tactile.get("expected_hz", 30.0))),
         max_image_dt_sec=float(sync.get("max_image_dt_sec", 0.10)),
         max_wrist_image_dt_sec=float(sync.get("max_wrist_image_dt_sec", 0.10)),
         max_action_dt_sec=float(sync.get("max_action_dt_sec", 0.08)),
@@ -264,12 +279,18 @@ def load_config(path: str | Path) -> RecordConfig:
         timestamp_diagnostics_interval_sec=max(
             1.0, float(sync.get("timestamp_diagnostics_interval_sec", 5.0))
         ),
+        require_unique_image_stamps=bool(sync.get("require_unique_image_stamps", True)),
         save_master_parquet_every_episode=bool(
             output.get("save_master_parquet_every_episode", True)
         ),
         save_debug_jsonl=bool(output.get("save_debug_jsonl", True)),
         write_queue_size=max(4, int(output.get("write_queue_size", 48))),
         tactile_batch_frames=max(1, int(output.get("tactile_batch_frames", 8))),
+        preserve_compressed_images=bool(output.get("preserve_compressed_images", True)),
+        png_compress_level=min(9, max(0, int(output.get("png_compress_level", 1)))),
+        writer_diagnostics_interval_sec=max(
+            1.0, float(output.get("writer_diagnostics_interval_sec", 5.0))
+        ),
     )
 
 
@@ -508,17 +529,44 @@ class RawCollectionNode(CommonRawCollectionNode):
         Node.__init__(self, "dmtac_w_raw_hilserl_zed_recorder")
         self.cfg = cfg
         self._lock = threading.Lock()
+        # One group per source preserves ordering within a topic while still
+        # allowing independent camera/tactile callbacks to run concurrently.
+        self._callback_groups = {
+            name: MutuallyExclusiveCallbackGroup()
+            for name in (
+                "front_image",
+                "wrist_image",
+                "wrist_camera_info",
+                "command",
+                "state",
+                "vr_pose",
+                "enabled",
+                "joystick",
+                "tactile_left",
+                "tactile_right",
+            )
+        }
 
-        self.image_buffer = TimedBuffer(maxlen=96)
-        self.wrist_image_buffer = TimedBuffer(maxlen=96)
+        self.image_buffer = TimedBuffer(
+            maxlen=max(96, int(math.ceil(cfg.image_expected_hz * cfg.buffer_history_sec)))
+        )
+        self.wrist_image_buffer = TimedBuffer(
+            maxlen=max(
+                96,
+                int(math.ceil(cfg.wrist_image_expected_hz * cfg.buffer_history_sec)),
+            )
+        )
         self.wrist_camera_info_buffer = TimedBuffer(maxlen=128)
         self.command_buffer = TimedBuffer(maxlen=4096)
         self.state_buffer = TimedBuffer(maxlen=4096)
         self.vr_pose_buffer = TimedBuffer(maxlen=2048)
         self.enabled_buffer = TimedBuffer(maxlen=2048)
         self.joystick_y_buffer = TimedBuffer(maxlen=2048)
-        self.tactile_left_buffer = TimedBuffer(maxlen=64)
-        self.tactile_right_buffer = TimedBuffer(maxlen=64)
+        tactile_buffer_len = max(
+            64, int(math.ceil(cfg.tactile_expected_hz * cfg.buffer_history_sec))
+        )
+        self.tactile_left_buffer = TimedBuffer(maxlen=tactile_buffer_len)
+        self.tactile_right_buffer = TimedBuffer(maxlen=tactile_buffer_len)
 
         front_image_qos = _image_qos_profile(
             cfg.image_qos_reliability,
@@ -560,16 +608,42 @@ class RawCollectionNode(CommonRawCollectionNode):
             cfg.image_topic,
             self._image_cb,
             front_image_qos,
+            callback_group=self._callback_groups["front_image"],
         )
-        self.create_subscription(Image, cfg.wrist_image_topic, self._wrist_image_cb, wrist_image_qos)
         self.create_subscription(
-            CameraInfo, cfg.wrist_camera_info_topic, self._wrist_camera_info_cb, wrist_image_qos
+            Image,
+            cfg.wrist_image_topic,
+            self._wrist_image_cb,
+            wrist_image_qos,
+            callback_group=self._callback_groups["wrist_image"],
         )
-        self.create_subscription(String, cfg.command_event_topic, self._command_event_cb, log_qos)
-        self.create_subscription(String, cfg.robot_state_topic, self._robot_state_cb, log_qos)
-        self.create_subscription(PoseStamped, cfg.raw_vr_target_pose_topic, self._vr_pose_cb, fast_qos)
-        self.create_subscription(Bool, cfg.enabled_topic, self._enabled_cb, fast_qos)
-        self.create_subscription(Float32, cfg.joystick_y_topic, self._joystick_y_cb, fast_qos)
+        self.create_subscription(
+            CameraInfo,
+            cfg.wrist_camera_info_topic,
+            self._wrist_camera_info_cb,
+            wrist_image_qos,
+            callback_group=self._callback_groups["wrist_camera_info"],
+        )
+        self.create_subscription(
+            String, cfg.command_event_topic, self._command_event_cb, log_qos,
+            callback_group=self._callback_groups["command"],
+        )
+        self.create_subscription(
+            String, cfg.robot_state_topic, self._robot_state_cb, log_qos,
+            callback_group=self._callback_groups["state"],
+        )
+        self.create_subscription(
+            PoseStamped, cfg.raw_vr_target_pose_topic, self._vr_pose_cb, fast_qos,
+            callback_group=self._callback_groups["vr_pose"],
+        )
+        self.create_subscription(
+            Bool, cfg.enabled_topic, self._enabled_cb, fast_qos,
+            callback_group=self._callback_groups["enabled"],
+        )
+        self.create_subscription(
+            Float32, cfg.joystick_y_topic, self._joystick_y_cb, fast_qos,
+            callback_group=self._callback_groups["joystick"],
+        )
 
         for side, topic, sensor_index in (
             ("left", cfg.tactile_left_packed_topic, 0),
@@ -580,6 +654,7 @@ class RawCollectionNode(CommonRawCollectionNode):
                 topic,
                 lambda msg, s=side, i=sensor_index: self._dmtac_packed_cb(s, i, msg),
                 packed_tactile_qos,
+                callback_group=self._callback_groups[f"tactile_{side}"],
             )
             self.get_logger().info(f"subscribe DM-Tac {side} packed frame: {topic}")
 
@@ -592,6 +667,11 @@ class RawCollectionNode(CommonRawCollectionNode):
         self.get_logger().info(
             f"subscribe local wrist image: {cfg.wrist_image_topic} "
             f"qos={cfg.wrist_image_qos_reliability}/depth{cfg.wrist_image_qos_depth}"
+        )
+        self.get_logger().info(
+            f"executor_threads={cfg.executor_threads} buffer_history={cfg.buffer_history_sec:.1f}s "
+            f"front={self.image_buffer.maxlen} wrist={self.wrist_image_buffer.maxlen} "
+            f"tactile_per_side={tactile_buffer_len}"
         )
 
     def _image_cb(self, msg: Image | CompressedImage) -> None:
@@ -678,13 +758,9 @@ def main() -> None:
 
     rclpy.init(args=None)
     node = RawCollectionNode(cfg)
-    spin_running = True
-
-    def spin_loop() -> None:
-        while spin_running and rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.02)
-
-    spin_thread = threading.Thread(target=spin_loop, daemon=True)
+    executor = MultiThreadedExecutor(num_threads=cfg.executor_threads)
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
     try:
@@ -706,8 +782,9 @@ def main() -> None:
         print("\n[KeyboardInterrupt] stopping")
         writer.flush_master()
     finally:
-        spin_running = False
+        executor.shutdown(timeout_sec=1.0)
         spin_thread.join(timeout=1.0)
+        executor.remove_node(node)
         node.destroy_node()
         rclpy.shutdown()
         writer.close()

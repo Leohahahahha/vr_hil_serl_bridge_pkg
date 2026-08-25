@@ -133,6 +133,7 @@ def check_raw_dataset(root: Path, sample_images: int, report: Reporter) -> None:
 
     _check_columns(df, report)
     _check_indices(df, report)
+    _check_candidate_continuity(df, report)
     _check_vectors(df, report)
     _print_sync_stats(df)
     _print_http_stats(df)
@@ -191,6 +192,73 @@ def _check_indices(df: pd.DataFrame, report: Reporter) -> None:
             report.error(f"frame_index is not contiguous for episode {ep}")
         episode_counts[ep] = int(len(sub))
     print(f"episodes_from_master: {episode_counts}")
+
+
+def _check_candidate_continuity(df: pd.DataFrame, report: Reporter) -> None:
+    """Check holes between saved candidates, excluding the pre-action prefix."""
+
+    if "candidate_index" not in df.columns:
+        return
+    episode_groups = (
+        df.groupby("episode_index", sort=True)
+        if "episode_index" in df.columns
+        else [(0, df)]
+    )
+    total_internal_missing = 0
+    total_duplicate_steps = 0
+    total_backwards_steps = 0
+    first_candidates: dict[int, int] = {}
+    gap_examples: list[tuple[int, int, int, int]] = []
+    for episode_index, sub in episode_groups:
+        ep = int(episode_index)
+        candidates = pd.to_numeric(
+            sub["candidate_index"], errors="coerce"
+        ).to_numpy(dtype=float)
+        finite = np.isfinite(candidates)
+        if not finite.all():
+            report.error(
+                f"candidate_index: episode {ep} has {int((~finite).sum())} invalid values"
+            )
+            candidates = candidates[finite]
+        if candidates.size == 0:
+            continue
+        candidates = candidates.astype(np.int64)
+        first_candidates[ep] = int(candidates[0])
+        if candidates.size < 2:
+            continue
+        diffs = np.diff(candidates)
+        total_duplicate_steps += int(np.count_nonzero(diffs == 0))
+        total_backwards_steps += int(np.count_nonzero(diffs < 0))
+        for row_index in np.flatnonzero(diffs > 1):
+            missing = int(diffs[row_index] - 1)
+            total_internal_missing += missing
+            if len(gap_examples) < 5:
+                gap_examples.append(
+                    (ep, int(row_index + 1), int(candidates[row_index]), missing)
+                )
+
+    print(
+        "candidate continuity: "
+        f"first_saved={first_candidates}, internal_missing={total_internal_missing}, "
+        f"duplicate_steps={total_duplicate_steps}, backwards_steps={total_backwards_steps}"
+    )
+    if total_internal_missing:
+        examples = ", ".join(
+            f"episode={ep}/row={row}/after={after}/missing={missing}"
+            for ep, row, after, missing in gap_examples
+        )
+        report.error(
+            f"candidate_index: {total_internal_missing} active-interval candidate steps "
+            f"are missing; examples: {examples}"
+        )
+    if total_duplicate_steps:
+        report.error(
+            f"candidate_index: {total_duplicate_steps} adjacent saved rows reuse a candidate"
+        )
+    if total_backwards_steps:
+        report.error(
+            f"candidate_index: {total_backwards_steps} adjacent saved rows move backwards"
+        )
 
 
 def _check_vectors(df: pd.DataFrame, report: Reporter) -> None:

@@ -96,10 +96,10 @@ import argparse
 import json
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Deque
+from typing import Any, Callable, Optional, Deque
 
 import numpy as np
 import yaml
@@ -131,6 +131,12 @@ try:
         tactile_row_fields as builder_tactile_row_fields,
     )
     from .raw_dataset_writer import PAXINI_RAW_WRITER_PROFILE, RawDatasetWriter
+    from .stream_sampling import (
+        has_usable_action_label,
+        nearest_time_ordered,
+        ros_message_stamp_ns,
+        skip_reason_key,
+    )
 except ImportError:
     from action_space import (  # type: ignore
         ACTION_NAMES,
@@ -144,6 +150,12 @@ except ImportError:
         tactile_row_fields as builder_tactile_row_fields,
     )
     from raw_dataset_writer import PAXINI_RAW_WRITER_PROFILE, RawDatasetWriter  # type: ignore
+    from stream_sampling import (  # type: ignore
+        has_usable_action_label,
+        nearest_time_ordered,
+        ros_message_stamp_ns,
+        skip_reason_key,
+    )
 
 
 TACTILE_FRAME_BYTES = 234
@@ -340,17 +352,24 @@ class TimedBuffer:
     def append(self, t: float, payload: Any) -> None:
         self._buf.append(TimedItem(float(t), payload))
 
+    @property
+    def maxlen(self) -> int:
+        return int(self._buf.maxlen or 0)
+
     def latest(self) -> Optional[TimedItem]:
         if not self._buf:
             return None
         return self._buf[-1]
 
-    def nearest(self, t: float) -> Optional[TimedItem]:
+    def nearest(
+        self,
+        t: float,
+        *,
+        accept: Optional[Callable[[TimedItem], bool]] = None,
+    ) -> Optional[TimedItem]:
         if not self._buf:
             return None
-        # Buffer is short; linear scan is simple and robust.
-        best = min(self._buf, key=lambda item: abs(item.t - t))
-        return best
+        return nearest_time_ordered(self._buf, t, accept=accept)
 
 
 # ============================================================
@@ -512,11 +531,29 @@ class RawCollectionNode(Node):
         with self._lock:
             self.tactile_right_buffer.append(recv_t, payload)
 
-    def get_nearest_bundle(self, t_frame: float) -> dict[str, Optional[TimedItem]]:
+    def get_nearest_bundle(
+        self,
+        t_frame: float,
+        *,
+        min_image_stamp_ns: Optional[int] = None,
+        min_wrist_image_stamp_ns: Optional[int] = None,
+    ) -> dict[str, Optional[TimedItem]]:
+        def newer_than(minimum: Optional[int]) -> Optional[Callable[[TimedItem], bool]]:
+            if minimum is None or minimum <= 0:
+                return None
+            return lambda item: (
+                ros_message_stamp_ns(item.payload) <= 0
+                or ros_message_stamp_ns(item.payload) > minimum
+            )
+
         with self._lock:
             return {
-                "image": self.image_buffer.nearest(t_frame),
-                "wrist_image": self.wrist_image_buffer.nearest(t_frame),
+                "image": self.image_buffer.nearest(
+                    t_frame, accept=newer_than(min_image_stamp_ns)
+                ),
+                "wrist_image": self.wrist_image_buffer.nearest(
+                    t_frame, accept=newer_than(min_wrist_image_stamp_ns)
+                ),
                 "wrist_camera_info": self.wrist_camera_info_buffer.nearest(t_frame),
                 "command": self.command_buffer.nearest(t_frame),
                 "state": self.state_buffer.nearest(t_frame),
@@ -638,6 +675,17 @@ def record_episode(
     candidate_count = 0
     saved_count = 0
     skip_count = 0
+    pre_action_skip_count = 0
+    active_candidate_count = 0
+    active_skip_count = 0
+    active_started = False
+    active_skip_reasons: Counter[str] = Counter()
+    pre_action_skip_reasons: Counter[str] = Counter()
+    require_unique_image_stamps = bool(
+        getattr(cfg, "require_unique_image_stamps", False)
+    )
+    last_image_stamp_ns: Optional[int] = None
+    last_wrist_image_stamp_ns: Optional[int] = None
 
     print(f"[RECORD] episode={episode_index}, fps={cfg.fps}, max_episode_sec={cfg.max_episode_sec}")
     sync_thresholds = ObservationSyncThresholds(
@@ -680,7 +728,28 @@ def record_episode(
             next_t += period
             candidate_count += 1
 
-            bundle = node.get_nearest_bundle(t_frame)
+            bundle = node.get_nearest_bundle(
+                t_frame,
+                min_image_stamp_ns=(
+                    last_image_stamp_ns if require_unique_image_stamps else None
+                ),
+                min_wrist_image_stamp_ns=(
+                    last_wrist_image_stamp_ns if require_unique_image_stamps else None
+                ),
+            )
+            action_ready = has_usable_action_label(
+                bundle.get("command"),
+                t_frame,
+                cfg.max_action_dt_sec,
+            )
+            if action_ready and not active_started:
+                active_started = True
+                print(
+                    f"[ACTIVE] first valid action at candidate={candidate_count - 1} "
+                    f"timestamp={timestamp:.3f}s"
+                )
+            if active_started:
+                active_candidate_count += 1
             build_result = build_observation_frame(
                 bundle=bundle,
                 t_frame=t_frame,
@@ -689,8 +758,22 @@ def record_episode(
             )
             if not build_result.ok or build_result.frame is None:
                 skip_count += 1
+                reason_key = skip_reason_key(build_result.reason)
+                if active_started:
+                    active_skip_count += 1
+                    active_skip_reasons[reason_key] += 1
+                else:
+                    pre_action_skip_count += 1
+                    pre_action_skip_reasons[reason_key] += 1
                 if build_result.reason.startswith("left/right tactile data length mismatch"):
                     print(f"[WARN] {build_result.reason}")
+                elif active_started:
+                    print(
+                        f"[SKIP_ACTIVE] candidate={candidate_count - 1} "
+                        f"timestamp={timestamp:.3f}s saved={saved_count} "
+                        f"loop_lag_ms={loop_lag_sec * 1000.0:.1f} "
+                        f"reason={build_result.reason}"
+                    )
                 elif cfg.debug and build_result.reason == "enabled false or missing" and skip_count % 20 == 0:
                     print(f"[SKIP] enabled false or missing. saved={saved_count} skip={skip_count}")
                 elif cfg.debug and skip_count % 10 == 0:
@@ -748,8 +831,23 @@ def record_episode(
                 )
             except Exception as e:
                 skip_count += 1
+                reason_key = "frame_asset_enqueue_or_write_failed"
+                if active_started:
+                    active_skip_count += 1
+                    active_skip_reasons[reason_key] += 1
+                else:
+                    pre_action_skip_count += 1
+                    pre_action_skip_reasons[reason_key] += 1
                 print(f"[WARN] frame asset enqueue/write failed: {repr(e)}")
                 continue
+
+            if require_unique_image_stamps:
+                image_stamp_ns = ros_message_stamp_ns(image_item.payload)
+                wrist_stamp_ns = ros_message_stamp_ns(wrist_image_item.payload)
+                if image_stamp_ns > 0:
+                    last_image_stamp_ns = image_stamp_ns
+                if wrist_stamp_ns > 0:
+                    last_wrist_image_stamp_ns = wrist_stamp_ns
 
             wrist_camera_info_fields = builder_camera_info_to_record(wrist_camera_info_item, t_frame)
 
@@ -788,6 +886,7 @@ def record_episode(
                 "image.height": int(image_rec["height"]),
                 "image.width": int(image_rec["width"]),
                 "image.encoding": str(image_rec["encoding"]),
+                "image.storage_encoding": str(image_rec.get("storage_encoding", "png")),
                 "image.step": int(image_rec["step"]),
                 "image.ros_stamp_sec": int(image_rec["ros_stamp_sec"]),
                 "image.ros_stamp_nanosec": int(image_rec["ros_stamp_nanosec"]),
@@ -798,6 +897,9 @@ def record_episode(
                 "wrist_image.height": int(wrist_image_rec["height"]),
                 "wrist_image.width": int(wrist_image_rec["width"]),
                 "wrist_image.encoding": str(wrist_image_rec["encoding"]),
+                "wrist_image.storage_encoding": str(
+                    wrist_image_rec.get("storage_encoding", "png")
+                ),
                 "wrist_image.step": int(wrist_image_rec["step"]),
                 "wrist_image.ros_stamp_sec": int(wrist_image_rec["ros_stamp_sec"]),
                 "wrist_image.ros_stamp_nanosec": int(wrist_image_rec["ros_stamp_nanosec"]),
@@ -889,6 +991,13 @@ def record_episode(
         writer.discard_episode()
         return False, controller.quit
 
+    print(
+        f"[SKIP_SUMMARY] total={skip_count} pre_action={pre_action_skip_count} "
+        f"active_candidates={active_candidate_count} active_skipped={active_skip_count} "
+        f"pre_action_reasons={dict(pre_action_skip_reasons)} "
+        f"active_reasons={dict(active_skip_reasons)}"
+    )
+
     writer.commit_episode(episode_index)
     if cfg.save_master_parquet_every_episode:
         writer.flush_master()
@@ -896,6 +1005,9 @@ def record_episode(
         f"[DONE] episode {episode_index} saved={saved_count} skipped={skip_count} "
         f"max_loop_lag_ms={max_loop_lag_sec * 1000.0:.1f}"
     )
+    performance_text = getattr(writer, "performance_text", None)
+    if callable(performance_text):
+        print(f"[WRITER_SUMMARY] {performance_text()}")
     return True, controller.quit
 
 

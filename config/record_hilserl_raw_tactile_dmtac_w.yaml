@@ -17,6 +17,12 @@ record:
   task_index: 0
   wait_for_motion_enable_to_record: false
   debug: true
+  # Run camera, tactile, action and state callbacks concurrently. Heavy
+  # packed-tactile copies no longer serialize both camera callbacks.
+  executor_threads: 4
+  # Keep enough capture history to survive a temporary writer slowdown while
+  # the performance fixes below are being verified on the real host.
+  buffer_history_sec: 5.0
 
 server:
   url: "http://172.31.179.19:5000"
@@ -28,8 +34,8 @@ image:
   topic: "/zed/zed_node/rgb/color/rect/image/compressed"
   name: "front"
   # ZED runs on the Orin and publishes JPEG-compressed RGB at 30 Hz. The
-  # recorder keeps the original capture stamp and decodes only selected 10 Hz
-  # frames in the background writer. Set message_type="raw" and remove the
+  # recorder keeps the original capture stamp and writes selected 10 Hz JPEG
+  # bytes without decode/re-encode. Set message_type="raw" and remove the
   # /compressed suffix to use the legacy sensor_msgs/Image path.
   message_type: "compressed"
   expected_hz: 30.0
@@ -40,9 +46,10 @@ wrist_image:
   topic: "/camera/d405/color/image_raw"
   camera_info_topic: "/camera/d405/color/camera_info"
   name: "wrist"
-  # D405 remains local to the recorder host and retains its existing QoS.
-  qos_reliability: "reliable"
-  qos_depth: 5
+  expected_hz: 30.0
+  # Training needs the latest capture, not a reliable queue of old images.
+  qos_reliability: "best_effort"
+  qos_depth: 1
 
 tactile:
   msg_package: "dmtac_tactile"
@@ -50,6 +57,7 @@ tactile:
   # Must match dmtac_w_bridge.params.yaml. "shear_depth" records schema 3
   # (921,600 bytes/side); switch both files to "full" for legacy schema 1.
   output_mode: "shear_depth"
+  expected_hz: 30.0
   # The bridge samples at up to 30 Hz and publishes one packed message per
   # side. The 10 Hz recorder selects the nearest frame by the worker's capture
   # timestamp mapped into the monotonic clock domain.
@@ -98,13 +106,23 @@ sync:
   max_remote_image_future_sec: 0.05
   reject_unsynced_remote_stamp: true
   timestamp_diagnostics_interval_sec: 5.0
+  # A source image may be selected at most once. The sampler can select the
+  # next-nearest newer capture within the existing sync threshold.
+  require_unique_image_stamps: true
   use_monotonic_time: true
 
 output:
   save_master_parquet_every_episode: true
   save_debug_jsonl: true
-  # One task contains both PNGs and both tactile sides. The bounded queue gives
-  # explicit backpressure instead of silently growing memory without limit.
+  # One task contains the front JPEG, wrist PNG and both tactile sides. The
+  # bounded queue gives explicit backpressure instead of silently growing
+  # memory without limit.
   write_queue_size: 48
   # Resize/write both zarr arrays once per batch, not once per frame and side.
   tactile_batch_frames: 8
+  # The remote ZED frame is already JPEG. Preserve those exact bytes instead
+  # of decoding and re-encoding them as PNG in the real-time writer.
+  preserve_compressed_images: true
+  # D405 remains lossless PNG, using the fast compression setting.
+  png_compress_level: 1
+  writer_diagnostics_interval_sec: 5.0

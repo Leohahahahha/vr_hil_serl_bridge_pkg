@@ -52,5 +52,28 @@ class ImageTimestampCheckerTest(unittest.TestCase):
         self.assertTrue(any("gaps exceed" in message for message in report.warnings))
 
 
+class CandidateContinuityCheckerTest(unittest.TestCase):
+    def run_check(self, candidates: list[int]):
+        frame = pd.DataFrame(
+            {
+                "episode_index": [0] * len(candidates),
+                "candidate_index": candidates,
+            }
+        )
+        report = checker.Reporter()
+        checker._check_candidate_continuity(frame, report)
+        return report
+
+    def test_ignores_candidates_before_first_saved_action(self) -> None:
+        report = self.run_check([25, 26, 27, 28])
+        self.assertEqual(report.errors, [])
+
+    def test_rejects_only_internal_active_interval_holes(self) -> None:
+        report = self.run_check([25, 26, 29, 30])
+        self.assertTrue(
+            any("2 active-interval candidate steps" in message for message in report.errors)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

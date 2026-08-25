@@ -130,8 +130,19 @@ def merge_raw_tactile_datasets(
                         row = dict(raw_row)
                         old_front_rel = str(row["image.path"])
                         old_wrist_rel = str(row["wrist_image.path"])
-                        new_front_rel = front_image_dir / f"episode_{out_episode_index:06d}" / f"frame_{out_frame_index:06d}.png"
-                        new_wrist_rel = wrist_image_dir / f"episode_{out_episode_index:06d}" / f"frame_{out_frame_index:06d}.png"
+                        front_suffix = Path(old_front_rel).suffix.lower()
+                        if front_suffix not in {".jpg", ".jpeg", ".png"}:
+                            front_suffix = ".png"
+                        new_front_rel = (
+                            front_image_dir
+                            / f"episode_{out_episode_index:06d}"
+                            / f"frame_{out_frame_index:06d}{front_suffix}"
+                        )
+                        new_wrist_rel = (
+                            wrist_image_dir
+                            / f"episode_{out_episode_index:06d}"
+                            / f"frame_{out_frame_index:06d}.png"
+                        )
 
                         _copy_sidecar(raw_root, old_front_rel, tmp_root / new_front_rel)
                         _copy_sidecar(raw_root, old_wrist_rel, tmp_root / new_wrist_rel)
@@ -145,6 +156,7 @@ def merge_raw_tactile_datasets(
                         row["frame_index"] = int(out_frame_index)
                         row["index"] = int(global_index)
                         row["image.path"] = str(new_front_rel)
+                        row["image.storage_encoding"] = front_suffix.lstrip(".")
                         row["wrist_image.path"] = str(new_wrist_rel)
                         row["tactile.left.zarr_path"] = str(TACTILE_LEFT_REL)
                         row["tactile.right.zarr_path"] = str(TACTILE_RIGHT_REL)
@@ -444,6 +456,7 @@ def _rewrite_image_index_record(
         "height",
         "width",
         "encoding",
+        "storage_encoding",
         "step",
         "ros_stamp_sec",
         "ros_stamp_nanosec",
