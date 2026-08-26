@@ -8,7 +8,7 @@
 机械臂腕部相机D405的彩色图像
 
 	训练动作命令
-	    action = 相对当前机械臂状态的目标增量 + 绝对夹爪宽度
+	    action = 相对当前机械臂状态的目标增量 + 目标单指绝对位置（m）
 	        [
 	        target_x - current_x,
 	        target_y - current_y,
@@ -16,14 +16,15 @@
 	        delta_rotvec_x,
 	        delta_rotvec_y,
 	        delta_rotvec_z,
-	        target_gripper_width
+	        target_gripper_width / 2
 	        ]
 	    action.sent_action8 仍保存实际发给机器人的原始绝对命令
 	    action.pose7 = [target_x, target_y, target_z, target_qx, target_qy, target_qz, target_qw]
 	    action.target_gripper_width
+	    action.target_gripper_finger_position
 
 	训练本体感知状态
-	    observation.state = 当前末端 xyz + 当前姿态 rotvec + 当前夹爪宽度
+	    observation.state = 当前末端 xyz + 当前姿态 rotvec + 当前单指绝对位置（m）
 	        [
 	        current_x,
 	        current_y,
@@ -31,12 +32,14 @@
 	        current_rotvec_x,
 	        current_rotvec_y,
 	        current_rotvec_z,
-	        current_gripper_width
+	        current_gripper_width / 2
 	        ]
 
 	原始机械臂本体状态（位置、姿态、关节状态等）和夹爪宽度
 	    robot.ee_pose：7维数据
-    robot.gripper_pos：夹爪宽度
+    robot.gripper_pos：服务端原始归一化夹爪位置
+    robot.gripper_width：实际总开口宽度（m）
+    robot.gripper_finger_position：单指绝对位置（m）
     robot.q：7维数据，关节角度
     robot.dq：7维数据，关节速度
     robot.force：末端执行器受力
@@ -656,6 +659,7 @@ def record_episode(
             joystick_y_payload = obs.joystick_y_payload
             state_fields = obs.state_fields
             target_gripper_width = obs.target_gripper_width
+            target_gripper_finger_position = obs.target_gripper_finger_position
             observation_state7 = obs.observation_state7
             relative_action7 = obs.relative_action7
             enabled_val = obs.enabled_val
@@ -709,6 +713,9 @@ def record_episode(
                 "action.pose7": action8[:7].astype(np.float32).tolist(),
                 "action.target_gripper": float(action8[7]),
                 "action.target_gripper_width": float(target_gripper_width),
+                "action.target_gripper_finger_position": float(
+                    target_gripper_finger_position
+                ),
                 "action.command_type": str(command_event.get("command_type", command_event.get("type", ""))),
                 "action.pose_commanded": bool(command_event.get("pose_commanded", True)),
                 "action.gripper_commanded": bool(command_event.get("gripper_commanded", False)),
@@ -785,6 +792,9 @@ def record_episode(
                 "sent_pose7": action8[:7].astype(np.float32).tolist(),
                 "target_gripper": float(action8[7]),
                 "target_gripper_width": float(target_gripper_width),
+                "target_gripper_finger_position": float(
+                    target_gripper_finger_position
+                ),
                 "command_type": str(command_event.get("command_type", command_event.get("type", ""))),
                 "pose_commanded": bool(command_event.get("pose_commanded", True)),
                 "gripper_commanded": bool(command_event.get("gripper_commanded", False)),

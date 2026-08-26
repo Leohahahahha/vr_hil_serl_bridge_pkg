@@ -128,8 +128,10 @@ one LeRobot v2.1 Parquet file and two RGB videos per episode with these flat
 Tabero keys:
 
 - `image`, `wrist_image`: the ZED and D405 RGB streams.
-- `state`: float32 `[7]`, xyz + axis-angle + gripper.
-- `actions`: float32 `[7]`, absolute target xyz + axis-angle + gripper.
+- `state`: float32 `[7]`, xyz + axis-angle + measured single-finger absolute
+  position in meters (`robot.gripper_width / 2`).
+- `actions`: float32 `[7]`, absolute target xyz + axis-angle + target
+  single-finger absolute position in meters (`target_gripper_width / 2`).
 - `tactile_marker_motion`: float32 `[9,198,2]`. Slice 0 is the fixed 9x11
   marker reference grid from each finger; slices 1:9 are the last eight
   `reference + DM-Tac shear` frames, padded with episode frame 0 at startup.
@@ -155,6 +157,12 @@ ros2 run vive_teleop_tactile_bridge raw_dmtac_w_to_tabero_lerobot \
 ros2 run vive_teleop_tactile_bridge validate_tabero_lerobot \
   --root /absolute/path/to/tabero_lerobot_v21
 ```
+
+The converter writes the Tabero gripper slot only as a physical single-finger
+position in meters. New recordings already carry that contract. For a legacy
+recording whose `observation.state[6]` is the normalized 0--1 value, add
+`--state-gripper-unit normalized`; its action total-width fallback is still
+halved automatically.
 
 The default `--timing-policy strict` refuses missing candidates or irregular
 source timing. `--timing-policy compact` exists only for a file-format smoke

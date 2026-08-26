@@ -4,8 +4,9 @@
 This is the action-only first-reproduction contract:
 
 * ``image`` and ``wrist_image`` are RGB videos.
-* ``state`` is 7D xyz + axis-angle + gripper.
-* ``actions`` is the 7D absolute target xyz + axis-angle + gripper.
+* ``state`` is 7D xyz + axis-angle + measured single-finger position in meters.
+* ``actions`` is the 7D absolute target xyz + axis-angle + target
+  single-finger position in meters.
 * ``tactile_marker_motion`` is [9, 198, 2]: a reference marker grid followed
   by eight current-position history frames.  Dense DM-Tac shear is sampled on
   a 9x11 grid per finger and converted to current positions as grid + shear.
@@ -34,7 +35,6 @@ from .raw_dmtac_w_to_n0vtla_lerobot import (
     DMTacSource,
     EXPECTED_TACTILE_PACKAGE,
     _check_tactile_sync,
-    _convert_gripper,
     _find_episode_parquets,
     _image_shape,
     _load_json,
@@ -69,7 +69,15 @@ TOTAL_POINTS = POINTS_PER_SIDE * 2
 MARKER_SHAPE = (1 + HISTORY_LENGTH, TOTAL_POINTS, 2)
 DEPTH_SHAPE = (2, 240, 320)
 
-STATE_NAMES = ["x", "y", "z", "axis_angle_x", "axis_angle_y", "axis_angle_z", "gripper"]
+STATE_NAMES = [
+    "x",
+    "y",
+    "z",
+    "axis_angle_x",
+    "axis_angle_y",
+    "axis_angle_z",
+    "gripper_finger_position_m",
+]
 ACTION_NAMES = [
     "target_x",
     "target_y",
@@ -77,7 +85,7 @@ ACTION_NAMES = [
     "target_axis_angle_x",
     "target_axis_angle_y",
     "target_axis_angle_z",
-    "target_gripper",
+    "target_gripper_finger_position_m",
 ]
 WRENCH_NAMES = ["force_x", "force_y", "force_z", "torque_x", "torque_y", "torque_z"]
 
@@ -115,8 +123,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-gripper-unit",
         choices=("normalized", "meter"),
-        default="normalized",
-        help="Unit of raw observation.state[-1]",
+        default="meter",
+        help="Unit of raw observation.state[-1]; current recordings use meter",
+    )
+    parser.add_argument(
+        "--state-gripper-coordinate",
+        choices=("finger", "total_width"),
+        default="finger",
+        help="Meaning of raw observation.state[-1]; current recordings use finger",
     )
     parser.add_argument(
         "--action-gripper-unit",
@@ -126,9 +140,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--gripper-output-unit",
-        choices=("normalized", "meter"),
-        default="normalized",
-        help="Common gripper unit written into state/actions",
+        choices=("meter",),
+        default="meter",
+        help="Tabero output unit; fixed to physical meters",
     )
     parser.add_argument(
         "--gripper-open-width-m",
@@ -153,6 +167,7 @@ def main() -> None:
         max_tactile_sync_sec=args.max_tactile_sync_sec,
         shear_scale=args.shear_scale,
         state_gripper_unit=args.state_gripper_unit,
+        state_gripper_coordinate=args.state_gripper_coordinate,
         action_gripper_unit=args.action_gripper_unit,
         gripper_output_unit=args.gripper_output_unit,
         gripper_open_width_m=args.gripper_open_width_m,
@@ -172,9 +187,10 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     timing_tolerance_sec: float | None = None,
     max_tactile_sync_sec: float = 0.15,
     shear_scale: float = 1.0,
-    state_gripper_unit: str = "normalized",
+    state_gripper_unit: str = "meter",
+    state_gripper_coordinate: str = "finger",
     action_gripper_unit: str = "meter",
-    gripper_output_unit: str = "normalized",
+    gripper_output_unit: str = "meter",
     gripper_open_width_m: float = 0.085,
     video_codec: str = "mp4v",
     overwrite: bool = False,
@@ -205,6 +221,10 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         raise ValueError("shear_scale must be finite and positive")
     if gripper_open_width_m <= 0:
         raise ValueError("gripper_open_width_m must be positive")
+    if state_gripper_coordinate not in {"finger", "total_width"}:
+        raise ValueError(f"unsupported state_gripper_coordinate={state_gripper_coordinate!r}")
+    if gripper_output_unit != "meter":
+        raise ValueError("Tabero state/actions gripper output must use physical meters")
     if len(video_codec) != 4:
         raise ValueError("video_codec must be a four-character FourCC value")
 
@@ -318,8 +338,8 @@ def export_raw_dmtac_w_to_tabero_lerobot(
             state, action = _tabero_state_action(
                 raw_row,
                 state_gripper_unit=state_gripper_unit,
+                state_gripper_coordinate=state_gripper_coordinate,
                 action_gripper_unit=action_gripper_unit,
-                gripper_output_unit=gripper_output_unit,
                 gripper_open_width_m=gripper_open_width_m,
             )
             wrench = np.concatenate(
@@ -398,6 +418,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         wrist_shape=wrist_shape,
         video_codec=video_codec,
         gripper_output_unit=gripper_output_unit,
+        gripper_open_width_m=gripper_open_width_m,
         schema_versions=sorted(schema_versions),
     )
     _write_json(out_root / "meta" / "info.json", info)
@@ -442,9 +463,13 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         },
         "gripper": {
             "state_source_unit": state_gripper_unit,
+            "state_source_coordinate": state_gripper_coordinate,
             "action_source_unit": action_gripper_unit,
-            "output_unit": gripper_output_unit,
+            "action_source_coordinate": "total_width (legacy) or explicit finger field",
+            "output_unit": "meter",
+            "output_coordinate": "single_finger_absolute_position",
             "open_width_m": float(gripper_open_width_m),
+            "max_finger_position_m": float(gripper_open_width_m / 2.0),
         },
         "orphan_tactile_rows": {
             "left": int(left_source.array.shape[0] - len(referenced_left)),
@@ -469,27 +494,73 @@ def _tabero_state_action(
     row: pd.Series,
     *,
     state_gripper_unit: str,
+    state_gripper_coordinate: str,
     action_gripper_unit: str,
-    gripper_output_unit: str,
     gripper_open_width_m: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     state = _vector(row["observation.state"], STATE_DIM, "observation.state").copy()
     target_pose = _vector(row["action.pose7"], 7, "action.pose7")
-    state[6] = _convert_gripper(
-        float(state[6]), state_gripper_unit, gripper_output_unit, gripper_open_width_m
+    state[6] = _source_gripper_to_finger_m(
+        float(state[6]),
+        unit=state_gripper_unit,
+        coordinate=state_gripper_coordinate,
+        gripper_open_width_m=gripper_open_width_m,
     )
-    target_gripper = _convert_gripper(
-        float(row["action.target_gripper_width"]),
-        action_gripper_unit,
-        gripper_output_unit,
-        gripper_open_width_m,
-    )
+    explicit_finger = row.get("action.target_gripper_finger_position")
+    if explicit_finger is not None and not pd.isna(explicit_finger):
+        target_gripper = float(explicit_finger)
+        legacy_finger = _source_gripper_to_finger_m(
+            float(row["action.target_gripper_width"]),
+            unit=action_gripper_unit,
+            coordinate="total_width",
+            gripper_open_width_m=gripper_open_width_m,
+        )
+        if not np.isclose(target_gripper, legacy_finger, rtol=0.0, atol=1e-7):
+            raise ValueError(
+                "action.target_gripper_finger_position does not equal "
+                "action.target_gripper_width/2"
+            )
+    else:
+        target_gripper = _source_gripper_to_finger_m(
+            float(row["action.target_gripper_width"]),
+            unit=action_gripper_unit,
+            coordinate="total_width",
+            gripper_open_width_m=gripper_open_width_m,
+        )
     action = np.concatenate(
         [target_pose[:3], _quat_xyzw_to_rotvec(target_pose[3:7]), [target_gripper]]
     ).astype(np.float32)
     if not np.all(np.isfinite(state)) or not np.all(np.isfinite(action)):
         raise ValueError("Tabero state/action contains non-finite values")
+    max_finger_position = 0.5 * float(gripper_open_width_m)
+    if state[6] < 0.0 or state[6] > max_finger_position + 1e-6:
+        raise ValueError(f"state gripper finger position {state[6]} is outside physical range")
+    if action[6] < 0.0 or action[6] > max_finger_position + 1e-6:
+        raise ValueError(f"action gripper finger position {action[6]} is outside physical range")
     return state.astype(np.float32), action
+
+
+def _source_gripper_to_finger_m(
+    value: float,
+    *,
+    unit: str,
+    coordinate: str,
+    gripper_open_width_m: float,
+) -> float:
+    value = float(value)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(f"invalid gripper value: {value!r}")
+    if unit == "normalized":
+        if value > 1.0 + 1e-6:
+            raise ValueError(f"normalized gripper value outside [0,1]: {value}")
+        return value * float(gripper_open_width_m) / 2.0
+    if unit != "meter":
+        raise ValueError(f"unsupported gripper unit: {unit!r}")
+    if coordinate == "finger":
+        return value
+    if coordinate == "total_width":
+        return value / 2.0
+    raise ValueError(f"unsupported gripper coordinate: {coordinate!r}")
 
 
 def _quat_xyzw_to_rotvec(quaternion: np.ndarray) -> np.ndarray:
@@ -693,6 +764,7 @@ def _build_info(
     wrist_shape: list[int],
     video_codec: str,
     gripper_output_unit: str,
+    gripper_open_width_m: float,
     schema_versions: list[int],
 ) -> dict[str, Any]:
     features: dict[str, Any] = {
@@ -747,6 +819,9 @@ def _build_info(
         "action_supervision": "actions[7] only",
         "wrench_supervision": False,
         "gripper_unit": gripper_output_unit,
+        "gripper_coordinate": "single_finger_absolute_position",
+        "gripper_open_width_m": float(gripper_open_width_m),
+        "gripper_max_finger_position_m": float(gripper_open_width_m / 2.0),
         "tactile_msg_package": EXPECTED_TACTILE_PACKAGE,
         "source_tactile_schema_versions": schema_versions,
         "conversion_metadata_path": "meta/tabero_conversion.json",
@@ -758,6 +833,10 @@ def validate_tabero_lerobot(root: Path) -> dict[str, Any]:
     info = _load_json(root / "meta" / "info.json")
     if info.get("codebase_version") != "v2.1":
         raise ValueError("Tabero export must use LeRobot codebase_version v2.1")
+    if info.get("gripper_unit") != "meter":
+        raise ValueError("Tabero gripper unit must be meter")
+    if info.get("gripper_coordinate") != "single_finger_absolute_position":
+        raise ValueError("Tabero gripper coordinate must be single_finger_absolute_position")
     expected_features = {
         STATE_KEY: [STATE_DIM],
         ACTION_KEY: [ACTION_DIM],
@@ -790,6 +869,7 @@ def validate_tabero_lerobot(root: Path) -> dict[str, Any]:
         total_rows += length
         marker = np.asarray(table[MARKER_KEY].to_pylist(), dtype=np.float32)
         depth = np.asarray(table[DEPTH_KEY].to_pylist(), dtype=np.float32)
+        states = np.asarray(table[STATE_KEY].to_pylist(), dtype=np.float32)
         actions = np.asarray(table[ACTION_KEY].to_pylist(), dtype=np.float32)
         if marker.shape != (length,) + MARKER_SHAPE:
             raise ValueError(f"episode {expected_episode}: marker shape {marker.shape}")
@@ -797,8 +877,18 @@ def validate_tabero_lerobot(root: Path) -> dict[str, Any]:
             raise ValueError(f"episode {expected_episode}: depth shape {depth.shape}")
         if actions.shape != (length, ACTION_DIM):
             raise ValueError(f"episode {expected_episode}: action shape {actions.shape}")
+        if states.shape != (length, STATE_DIM):
+            raise ValueError(f"episode {expected_episode}: state shape {states.shape}")
         if not np.all(np.isfinite(marker)) or not np.all(np.isfinite(depth)):
             raise ValueError(f"episode {expected_episode}: non-finite tactile data")
+        max_finger_position = float(info["gripper_max_finger_position_m"])
+        for label, values in (("state", states[:, 6]), ("actions", actions[:, 6])):
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"episode {expected_episode}: non-finite {label} gripper values")
+            if np.any(values < -1e-6) or np.any(values > max_finger_position + 1e-6):
+                raise ValueError(
+                    f"episode {expected_episode}: {label}[6] outside physical single-finger range"
+                )
         if length > 0 and not np.allclose(marker[0, 1:], marker[0, 1], rtol=0, atol=0):
             raise ValueError(f"episode {expected_episode}: initial marker history is not frame-0 padded")
         for video_key in VIDEO_KEYS:

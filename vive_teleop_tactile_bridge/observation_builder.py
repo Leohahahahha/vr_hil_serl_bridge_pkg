@@ -7,9 +7,19 @@ from typing import Any, Optional
 import numpy as np
 
 try:
-    from .action_space import normalize_quat_xyzw, pose7_to_state7, target_pose_to_relative_action7
+    from .action_space import (
+        gripper_width_to_finger_position,
+        normalize_quat_xyzw,
+        pose7_to_state7,
+        target_pose_to_relative_action7,
+    )
 except ImportError:
-    from action_space import normalize_quat_xyzw, pose7_to_state7, target_pose_to_relative_action7  # type: ignore
+    from action_space import (  # type: ignore
+        gripper_width_to_finger_position,
+        normalize_quat_xyzw,
+        pose7_to_state7,
+        target_pose_to_relative_action7,
+    )
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,7 @@ class ObservationFrame:
     state_fields: dict[str, Any]
     action8: np.ndarray
     target_gripper_width: float
+    target_gripper_finger_position: float
     observation_state7: np.ndarray
     relative_action7: np.ndarray
 
@@ -89,6 +100,16 @@ def _as_float_list(x: Any, max_len: Optional[int] = None) -> Optional[list[float
         return None
 
 
+def _as_float_scalar(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        value = float(np.asarray(x).reshape(-1)[0])
+    except Exception:
+        return None
+    return value if np.isfinite(value) else None
+
+
 def extract_state_fields(state_event: dict[str, Any]) -> dict[str, Any]:
     raw_state = state_event.get("state")
     if not isinstance(raw_state, dict):
@@ -96,6 +117,9 @@ def extract_state_fields(state_event: dict[str, Any]) -> dict[str, Any]:
             "robot.raw_state_json": json.dumps(raw_state, ensure_ascii=False),
             "robot.ee_pose": None,
             "robot.gripper_pos": None,
+            "robot.gripper_pos_normalized": None,
+            "robot.gripper_width": None,
+            "robot.gripper_finger_position": None,
             "robot.q": None,
             "robot.dq": None,
             "robot.force": None,
@@ -103,12 +127,27 @@ def extract_state_fields(state_event: dict[str, Any]) -> dict[str, Any]:
         }
 
     ee_pose = raw_state.get("pose", raw_state.get("ee_pose", raw_state.get("pos")))
-    gripper_pos = raw_state.get("gripper_pos", raw_state.get("gripper", raw_state.get("gripper_width")))
+    # The Franka server exposes both values in current deployments:
+    # gripper_pos is normalized, while gripper_width is the physical total
+    # jaw opening in meters.  Never silently substitute the normalized value
+    # for a physical width because Tabero uses one finger's absolute position.
+    gripper_pos_normalized = _as_float_scalar(raw_state.get("gripper_pos"))
+    gripper_width = _as_float_scalar(raw_state.get("gripper_width"))
+    gripper_finger_position = None
+    if gripper_width is not None:
+        try:
+            gripper_finger_position = gripper_width_to_finger_position(gripper_width)
+        except ValueError:
+            gripper_width = None
 
     return {
         "robot.raw_state_json": json.dumps(raw_state, ensure_ascii=False),
         "robot.ee_pose": _as_float_list(ee_pose, 7),
-        "robot.gripper_pos": None if gripper_pos is None else float(np.asarray(gripper_pos).reshape(-1)[0]),
+        # Keep robot.gripper_pos for raw backward provenance; it is normalized.
+        "robot.gripper_pos": gripper_pos_normalized,
+        "robot.gripper_pos_normalized": gripper_pos_normalized,
+        "robot.gripper_width": gripper_width,
+        "robot.gripper_finger_position": gripper_finger_position,
         "robot.q": _as_float_list(raw_state.get("q"), 7),
         "robot.dq": _as_float_list(raw_state.get("dq"), 7),
         "robot.vel": _as_float_list(raw_state.get("vel"), None),
@@ -252,22 +291,36 @@ def build_observation_frame(
 
     state_fields = extract_state_fields(state_event)
     current_pose7 = state_fields.get("robot.ee_pose")
-    current_gripper_width = state_fields.get("robot.gripper_pos")
-    if current_pose7 is None or current_gripper_width is None:
-        return ObservationBuildResult(ok=False, reason="robot state missing ee pose or gripper width")
+    current_gripper_finger_position = state_fields.get("robot.gripper_finger_position")
+    if current_pose7 is None or current_gripper_finger_position is None:
+        return ObservationBuildResult(
+            ok=False,
+            reason="robot state missing ee pose or physical gripper_width",
+        )
 
     try:
         target_gripper_width = float(
             command_event.get("target_gripper_width", command_event.get("target_gripper", action8[7]))
         )
+        target_gripper_finger_position = gripper_width_to_finger_position(target_gripper_width)
+        event_finger_position = command_event.get("target_gripper_finger_position")
+        if event_finger_position is not None and not np.isclose(
+            float(event_finger_position),
+            target_gripper_finger_position,
+            rtol=0.0,
+            atol=1e-7,
+        ):
+            raise ValueError(
+                "target_gripper_finger_position does not equal target_gripper_width/2"
+            )
         observation_state7 = pose7_to_state7(
             np.asarray(current_pose7, dtype=np.float32),
-            current_gripper_width,
+            current_gripper_finger_position,
         )
         relative_action7 = target_pose_to_relative_action7(
             target_pose7=action8[:7],
             current_pose7=np.asarray(current_pose7, dtype=np.float32),
-            target_gripper_width=target_gripper_width,
+            target_gripper_finger_position_m=target_gripper_finger_position,
         )
     except Exception as e:
         return ObservationBuildResult(ok=False, reason=f"state/action conversion failed: {repr(e)}")
@@ -290,6 +343,7 @@ def build_observation_frame(
         state_fields=state_fields,
         action8=action8,
         target_gripper_width=target_gripper_width,
+        target_gripper_finger_position=target_gripper_finger_position,
         observation_state7=observation_state7,
         relative_action7=relative_action7,
         vr_payload=vr_pose_item.payload if vr_pose_item is not None else {},

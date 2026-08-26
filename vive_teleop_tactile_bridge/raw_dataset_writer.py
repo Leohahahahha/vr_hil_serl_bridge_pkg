@@ -337,6 +337,13 @@ class RawDatasetWriter:
             "state_dim": 7,
             "action_names": ACTION_NAMES,
             "action_dim": 7,
+            "gripper_coordinate_contract": {
+                "version": 1,
+                "unit": "meter",
+                "state_6": "measured single-finger absolute position = robot.gripper_width / 2",
+                "action_6": "target single-finger absolute position = action.target_gripper_width / 2",
+                "total_open_width_m": 0.085,
+            },
             "storage": {
                 "master_parquet": "data/chunk-000/file-000.parquet",
                 "per_episode_parquet_dir": "data/episodes",
@@ -351,10 +358,13 @@ class RawDatasetWriter:
                 "raw_robot_state_events": "raw/robot_state_events.jsonl",
             },
             "features": {
-                "observation.state": "float32[7], current xyz + absolute rotation vector + current gripper width",
+                "observation.state": (
+                    "float32[7], current xyz + absolute rotation vector + "
+                    "measured single-finger absolute position in meters"
+                ),
                 "action": (
                     "float32[7], target pose relative to current pose as xyz delta "
-                    "+ rotation-vector delta + target gripper width"
+                    "+ rotation-vector delta + target single-finger absolute position in meters"
                 ),
                 "action.sent_action8": (
                     "float32[8], raw absolute robot command event pose7 + target gripper width"
@@ -368,7 +378,19 @@ class RawDatasetWriter:
                 "action.motion_enabled": "bool, /vr_bridge/enabled value captured by the command event",
                 "action.http_route": "string, HTTP route used by the command event, e.g. /pose or /move_gripper",
                 "robot.ee_pose": "float32[7], absolute current end-effector pose parsed from /getstate",
-                "robot.gripper_pos": "float, current gripper width parsed from /getstate",
+                "robot.gripper_pos": "float, normalized gripper position parsed from /getstate",
+                "robot.gripper_pos_normalized": (
+                    "float, explicit alias of normalized robot.gripper_pos"
+                ),
+                "robot.gripper_width": "float, measured total gripper opening in meters",
+                "robot.gripper_finger_position": (
+                    "float, measured single-finger absolute position = robot.gripper_width / 2"
+                ),
+                "action.target_gripper_width": "float, commanded total gripper opening in meters",
+                "action.target_gripper_finger_position": (
+                    "float, commanded single-finger absolute position = "
+                    "action.target_gripper_width / 2"
+                ),
                 "image.path": (
                     "relative path to ZED front RGB sidecar; source JPEG is retained "
                     "when configured"

@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 
+import numpy as np
 import pandas as pd
 
 
@@ -73,6 +74,48 @@ class CandidateContinuityCheckerTest(unittest.TestCase):
         self.assertTrue(
             any("2 active-interval candidate steps" in message for message in report.errors)
         )
+
+
+class GripperCoordinateCheckerTest(unittest.TestCase):
+    def contract(self) -> dict:
+        return {
+            "gripper_coordinate_contract": {
+                "version": 1,
+                "unit": "meter",
+                "total_open_width_m": 0.085,
+            }
+        }
+
+    def frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "observation.state": [
+                    np.asarray([0.4, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0425])
+                ],
+                "action": [
+                    np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.02])
+                ],
+                "robot.gripper_width": [0.085],
+                "robot.gripper_finger_position": [0.0425],
+                "action.target_gripper_width": [0.04],
+                "action.target_gripper_finger_position": [0.02],
+            }
+        )
+
+    def test_accepts_consistent_single_finger_meter_contract(self) -> None:
+        report = checker.Reporter()
+        checker._check_gripper_coordinate_contract(self.frame(), self.contract(), report)
+        self.assertEqual(report.errors, [])
+        self.assertEqual(report.warnings, [])
+
+    def test_rejects_total_width_written_into_action_slot(self) -> None:
+        frame = self.frame()
+        frame.at[0, "action"] = np.asarray(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04]
+        )
+        report = checker.Reporter()
+        checker._check_gripper_coordinate_contract(frame, self.contract(), report)
+        self.assertTrue(any("action[6]" in message for message in report.errors))
 
 
 if __name__ == "__main__":

@@ -9,14 +9,32 @@ from scipy.spatial.transform import Rotation as R
 STATE_NAMES = [
     "current_x", "current_y", "current_z",
     "current_rotvec_x", "current_rotvec_y", "current_rotvec_z",
-    "current_gripper_width",
+    "current_gripper_finger_position_m",
 ]
 
 ACTION_NAMES = [
     "delta_x", "delta_y", "delta_z",
     "delta_rotvec_x", "delta_rotvec_y", "delta_rotvec_z",
-    "target_gripper_width",
+    "target_gripper_finger_position_m",
 ]
+
+
+def gripper_width_to_finger_position(gripper_width_m: float) -> float:
+    """Convert total jaw opening to one finger's absolute position in meters."""
+    width = float(gripper_width_m)
+    if not np.isfinite(width) or width < 0.0:
+        raise ValueError(f"gripper width must be finite and non-negative, got {gripper_width_m!r}")
+    return 0.5 * width
+
+
+def finger_position_to_gripper_width(finger_position_m: float) -> float:
+    """Convert a model-predicted single-finger position back to total opening."""
+    position = float(finger_position_m)
+    if not np.isfinite(position) or position < 0.0:
+        raise ValueError(
+            f"gripper finger position must be finite and non-negative, got {finger_position_m!r}"
+        )
+    return 2.0 * position
 
 
 def normalize_quat_xyzw(q: np.ndarray) -> np.ndarray:
@@ -27,12 +45,12 @@ def normalize_quat_xyzw(q: np.ndarray) -> np.ndarray:
     return (q / n).astype(np.float32)
 
 
-def pose7_to_state7(pose7: np.ndarray, gripper_width: float) -> np.ndarray:
+def pose7_to_state7(pose7: np.ndarray, gripper_finger_position_m: float) -> np.ndarray:
     pose7 = np.asarray(pose7, dtype=np.float32).reshape(7).copy()
     pose7[3:7] = normalize_quat_xyzw(pose7[3:7])
     rotvec = R.from_quat(pose7[3:7].astype(float)).as_rotvec().astype(np.float32)
     return np.concatenate(
-        [pose7[:3], rotvec, np.asarray([gripper_width], dtype=np.float32)],
+        [pose7[:3], rotvec, np.asarray([gripper_finger_position_m], dtype=np.float32)],
         axis=0,
     ).astype(np.float32)
 
@@ -41,7 +59,7 @@ def target_pose_to_relative_action7(
     *,
     target_pose7: np.ndarray,
     current_pose7: np.ndarray,
-    target_gripper_width: float,
+    target_gripper_finger_position_m: float,
 ) -> np.ndarray:
     target_pose7 = np.asarray(target_pose7, dtype=np.float32).reshape(7).copy()
     current_pose7 = np.asarray(current_pose7, dtype=np.float32).reshape(7).copy()
@@ -54,7 +72,11 @@ def target_pose_to_relative_action7(
     drotvec = (r_target * r_current.inv()).as_rotvec().astype(np.float32)
 
     return np.concatenate(
-        [dpos.astype(np.float32), drotvec, np.asarray([target_gripper_width], dtype=np.float32)],
+        [
+            dpos.astype(np.float32),
+            drotvec,
+            np.asarray([target_gripper_finger_position_m], dtype=np.float32),
+        ],
         axis=0,
     ).astype(np.float32)
 

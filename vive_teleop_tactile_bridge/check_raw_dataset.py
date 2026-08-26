@@ -135,6 +135,7 @@ def check_raw_dataset(root: Path, sample_images: int, report: Reporter) -> None:
     _check_indices(df, report)
     _check_candidate_continuity(df, report)
     _check_vectors(df, report)
+    _check_gripper_coordinate_contract(df, info, report)
     _print_sync_stats(df)
     _print_http_stats(df)
     _check_image_timestamps(df, "image", info, report)
@@ -278,6 +279,95 @@ def _check_vectors(df: pd.DataFrame, report: Reporter) -> None:
             if np.issubdtype(arr.dtype, np.number) and not np.all(np.isfinite(arr.astype(np.float64))):
                 report.error(f"{column} row {row_index} contains non-finite values")
                 break
+
+
+def _check_gripper_coordinate_contract(
+    df: pd.DataFrame,
+    info: dict[str, Any],
+    report: Reporter,
+) -> None:
+    contract = info.get("gripper_coordinate_contract")
+    if contract is None:
+        print("gripper contract: legacy/unspecified; semantic consistency was not checked")
+        return
+    if not isinstance(contract, dict):
+        report.error("meta/info.json gripper_coordinate_contract must be an object")
+        return
+    try:
+        contract_version = int(contract.get("version", -1))
+    except (TypeError, ValueError):
+        contract_version = -1
+    report.require(contract_version == 1, "unsupported gripper coordinate contract")
+    report.require(contract.get("unit") == "meter", "gripper coordinate unit must be meter")
+
+    required = (
+        "robot.gripper_width",
+        "robot.gripper_finger_position",
+        "action.target_gripper_width",
+        "action.target_gripper_finger_position",
+    )
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        report.error(f"gripper coordinate contract missing columns: {missing}")
+        return
+
+    numeric: dict[str, np.ndarray] = {}
+    for column in required:
+        values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+        if not np.all(np.isfinite(values)):
+            report.error(f"{column} contains null/non-finite values")
+            return
+        numeric[column] = values
+
+    measured_width = numeric["robot.gripper_width"]
+    measured_finger = numeric["robot.gripper_finger_position"]
+    target_width = numeric["action.target_gripper_width"]
+    target_finger = numeric["action.target_gripper_finger_position"]
+    if not np.allclose(measured_finger, measured_width / 2.0, rtol=0.0, atol=1e-7):
+        report.error("robot.gripper_finger_position does not equal robot.gripper_width/2")
+    if not np.allclose(target_finger, target_width / 2.0, rtol=0.0, atol=1e-7):
+        report.error(
+            "action.target_gripper_finger_position does not equal action.target_gripper_width/2"
+        )
+
+    try:
+        state_vectors = [
+            np.asarray(value, dtype=float).reshape(-1)
+            for value in df["observation.state"]
+        ]
+        action_vectors = [np.asarray(value, dtype=float).reshape(-1) for value in df["action"]]
+        if any(value.size < 7 for value in state_vectors + action_vectors):
+            raise ValueError("state/action vector has fewer than 7 values")
+        state_finger = np.asarray([value[6] for value in state_vectors])
+        action_finger = np.asarray([value[6] for value in action_vectors])
+    except Exception as exc:
+        report.error(f"could not read gripper slot from state/action vectors: {exc}")
+        return
+    if not np.allclose(state_finger, measured_finger, rtol=0.0, atol=1e-7):
+        report.error("observation.state[6] does not equal measured single-finger position")
+    if not np.allclose(action_finger, target_finger, rtol=0.0, atol=1e-7):
+        report.error("action[6] does not equal target single-finger position")
+
+    try:
+        total_open_width = float(contract.get("total_open_width_m", np.nan))
+    except (TypeError, ValueError):
+        total_open_width = float("nan")
+    if not np.isfinite(total_open_width) or total_open_width <= 0.0:
+        report.error("gripper_coordinate_contract.total_open_width_m must be positive")
+    else:
+        tolerance = 1e-6
+        for label, values in (
+            ("robot.gripper_width", measured_width),
+            ("action.target_gripper_width", target_width),
+        ):
+            if np.any(values < -tolerance) or np.any(values > total_open_width + tolerance):
+                report.error(f"{label} is outside [0, {total_open_width}] m")
+
+    print(
+        "gripper contract: single_finger_meter, "
+        f"state_range=[{state_finger.min():.6f}, {state_finger.max():.6f}], "
+        f"action_range=[{action_finger.min():.6f}, {action_finger.max():.6f}]"
+    )
 
 
 def _print_sync_stats(df: pd.DataFrame) -> None:

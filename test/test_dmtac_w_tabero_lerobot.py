@@ -138,12 +138,13 @@ def _build_raw_dataset(root: Path) -> None:
                     "candidate_index": frame_index,
                     "frame_index": frame_index,
                     "observation.state": np.asarray(
-                        [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.5], dtype=np.float32
+                        [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.025], dtype=np.float32
                     ),
                     "action.pose7": np.asarray(
                         [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
                     ),
                     "action.target_gripper_width": 0.0425,
+                    "action.target_gripper_finger_position": 0.02125,
                     "robot.force": np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
                     "robot.torque": np.asarray([4.0, 5.0, 6.0], dtype=np.float32),
                     "image.path": str(image_rel),
@@ -183,6 +184,9 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
             self.assertEqual(info["features"][MARKER_KEY]["shape"], [9, 198, 2])
             self.assertEqual(info["features"][DEPTH_KEY]["shape"], [2, 240, 320])
             self.assertFalse(info["wrench_supervision"])
+            self.assertEqual(info["gripper_unit"], "meter")
+            self.assertEqual(info["gripper_coordinate"], "single_finger_absolute_position")
+            self.assertAlmostEqual(info["gripper_max_finger_position_m"], 0.0425)
 
             episode0 = pq.read_table(out_root / "data" / "chunk-000" / "episode_000000.parquet")
             episode1 = pq.read_table(out_root / "data" / "chunk-000" / "episode_000001.parquet")
@@ -190,6 +194,7 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
             marker1 = np.asarray(episode1[MARKER_KEY].to_pylist(), dtype=np.float32)
             depth0 = np.asarray(episode0[DEPTH_KEY].to_pylist(), dtype=np.float32)
             actions0 = np.asarray(episode0[ACTION_KEY].to_pylist(), dtype=np.float32)
+            states0 = np.asarray(episode0["state"].to_pylist(), dtype=np.float32)
 
             self.assertEqual(marker0.shape, (2, 9, 198, 2))
             self.assertTrue(np.array_equal(marker0[0, 1], marker0[0, 8]))
@@ -198,7 +203,11 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
             self.assertAlmostEqual(float(marker1[0, 8, 0, 0] - marker1[0, 0, 0, 0]), 2.0)
             self.assertAlmostEqual(float(depth0[0, 0, 0, 0]), 100.0)
             self.assertAlmostEqual(float(depth0[0, 1, 0, 0]), 200.0)
-            np.testing.assert_allclose(actions0[0], [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 0.5])
+            np.testing.assert_allclose(states0[0, 6], 0.025)
+            np.testing.assert_allclose(
+                actions0[0],
+                [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 0.02125],
+            )
 
             hf_meta = json.loads(episode0.schema.metadata[b"huggingface"])
             hf_features = hf_meta["info"]["features"]
@@ -220,6 +229,42 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
                         raw_root=raw_root,
                         out_root=temp / "out",
                     )
+
+    def test_legacy_normalized_state_is_converted_to_finger_meters(self) -> None:
+        row = pd.Series(
+            {
+                "observation.state": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
+                "action.pose7": [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0],
+                "action.target_gripper_width": 0.085,
+            }
+        )
+        state, action = tabero_export._tabero_state_action(
+            row,
+            state_gripper_unit="normalized",
+            state_gripper_coordinate="finger",
+            action_gripper_unit="meter",
+            gripper_open_width_m=0.085,
+        )
+        self.assertAlmostEqual(float(state[6]), 0.0425)
+        self.assertAlmostEqual(float(action[6]), 0.0425)
+
+    def test_rejects_inconsistent_explicit_target_finger_position(self) -> None:
+        row = pd.Series(
+            {
+                "observation.state": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.02],
+                "action.pose7": [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0],
+                "action.target_gripper_width": 0.04,
+                "action.target_gripper_finger_position": 0.03,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "does not equal"):
+            tabero_export._tabero_state_action(
+                row,
+                state_gripper_unit="meter",
+                state_gripper_coordinate="finger",
+                action_gripper_unit="meter",
+                gripper_open_width_m=0.085,
+            )
 
 
 if __name__ == "__main__":
