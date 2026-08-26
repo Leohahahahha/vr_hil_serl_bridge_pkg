@@ -52,6 +52,8 @@ setup(
             'raw_tashan_to_lerobot_v3 = vive_teleop_tactile_bridge.lerobot_export.raw_tashan_to_lerobot_v3:main',
             'raw_paxini_to_lerobot_v3 = vive_teleop_tactile_bridge.lerobot_export.raw_paxini_to_lerobot_v3:main',
             'raw_dmtac_w_to_n0vtla_lerobot = vive_teleop_tactile_bridge.lerobot_export.raw_dmtac_w_to_n0vtla_lerobot:main',
+            'raw_dmtac_w_to_tabero_lerobot = vive_teleop_tactile_bridge.lerobot_export.raw_dmtac_w_to_tabero_lerobot:main',
+            'validate_tabero_lerobot = vive_teleop_tactile_bridge.lerobot_export.validate_tabero_lerobot:main',
             'validate_lerobot_v3 = vive_teleop_tactile_bridge.lerobot_export.validate_lerobot_v3:main',
             'inspect_lerobot_v3_sample = vive_teleop_tactile_bridge.lerobot_export.inspect_lerobot_v3_sample:main',
             'lerobot_tactile_to_csv = vive_teleop_tactile_bridge.lerobot_export.export_lerobot_tactile_csv:main',

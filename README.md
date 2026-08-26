@@ -121,6 +121,53 @@ files. Watch `loop_lag_ms` and `max_loop_lag_ms` in recorder output: a sustained
 value near zero means disk work is no longer delaying the fixed-FPS
 synchronization loop.
 
+## DM-Tac W to Tabero LeRobot v2.1 (action-only baseline)
+
+This separate exporter is for the first Tabero-VTLA reproduction. It writes
+one LeRobot v2.1 Parquet file and two RGB videos per episode with these flat
+Tabero keys:
+
+- `image`, `wrist_image`: the ZED and D405 RGB streams.
+- `state`: float32 `[7]`, xyz + axis-angle + gripper.
+- `actions`: float32 `[7]`, absolute target xyz + axis-angle + gripper.
+- `tactile_marker_motion`: float32 `[9,198,2]`. Slice 0 is the fixed 9x11
+  marker reference grid from each finger; slices 1:9 are the last eight
+  `reference + DM-Tac shear` frames, padded with episode frame 0 at startup.
+- `wrist_wrench`: float32 `[6]`, retained for later work but not included in
+  the first action target.
+- `tactile_depth`: float32 `[2,240,320]`, retained but not read by the first
+  Tabero loader.
+
+The first Tabero loader/config must select only `image`, `wrist_image`,
+`state`, `tactile_marker_motion`, and `actions`. Its action dimension is 7;
+force prediction and force loss must be disabled. Do not concatenate
+`wrist_wrench` onto `actions`.
+
+Install the offline conversion dependencies in the Python environment used by
+the command: `numpy`, `pandas`, `pyarrow`, `zarr`, `Pillow`, and OpenCV. After
+rebuilding and sourcing the ROS 2 workspace, run:
+
+```bash
+ros2 run vive_teleop_tactile_bridge raw_dmtac_w_to_tabero_lerobot \
+  --raw-root /absolute/path/to/raw_dataset \
+  --out-root /absolute/path/to/tabero_lerobot_v21
+
+ros2 run vive_teleop_tactile_bridge validate_tabero_lerobot \
+  --root /absolute/path/to/tabero_lerobot_v21
+```
+
+The default `--timing-policy strict` refuses missing candidates or irregular
+source timing. `--timing-policy compact` exists only for a file-format smoke
+test because it changes the trajectory time scale. The exact grid indices,
+shear scale, gripper units, and retained-field definitions are recorded in
+`meta/tabero_conversion.json`.
+
+`--shear-scale 1.0` assumes the DM-Tac shear channels are expressed in the
+same pixel-coordinate convention as the sampled marker grid. Calibrate this
+factor (and sensor-axis orientation in the training preprocessing, if needed)
+before a final experiment; the converter deliberately does not estimate a
+scale from the training set.
+
 ## DM-Tac W to N0-VTLA canonical LeRobot
 
 The exporter accepts legacy schema 1 and shear/depth schema 3, decodes either
