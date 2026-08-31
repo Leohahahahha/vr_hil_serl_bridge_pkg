@@ -13,6 +13,8 @@ This is the action-only first-reproduction contract:
 * ``wrist_wrench`` and ``tactile_depth`` are retained for future experiments,
   but are not part of the action target and need not be read by the first
   Tabero loader.
+* The front RGB stream may optionally use one fixed ``x0 y0 x1 y1`` ROI while
+  the wrist RGB stream and the source PNG sidecars remain unchanged.
 
 The existing N0-VTLA exporter is intentionally separate and unchanged.
 """
@@ -150,6 +152,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.085,
         help="Fully open width used for normalized/meter conversion",
     )
+    parser.add_argument(
+        "--front-crop",
+        type=int,
+        nargs=4,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        default=None,
+        help=(
+            "Optional fixed ZED/front ROI in source pixels using xyxy coordinates; "
+            "X1/Y1 are exclusive. The wrist image is not cropped."
+        ),
+    )
     parser.add_argument("--video-codec", default="mp4v", help="FourCC codec used for RGB MP4 files")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output root")
     return parser
@@ -171,6 +184,7 @@ def main() -> None:
         action_gripper_unit=args.action_gripper_unit,
         gripper_output_unit=args.gripper_output_unit,
         gripper_open_width_m=args.gripper_open_width_m,
+        front_crop=tuple(args.front_crop) if args.front_crop is not None else None,
         video_codec=args.video_codec,
         overwrite=args.overwrite,
     )
@@ -192,6 +206,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     action_gripper_unit: str = "meter",
     gripper_output_unit: str = "meter",
     gripper_open_width_m: float = 0.085,
+    front_crop: tuple[int, int, int, int] | None = None,
     video_codec: str = "mp4v",
     overwrite: bool = False,
 ) -> dict[str, Any]:
@@ -227,6 +242,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         raise ValueError("Tabero state/actions gripper output must use physical meters")
     if len(video_codec) != 4:
         raise ValueError("video_codec must be a four-character FourCC value")
+    front_crop = _normalize_front_crop(front_crop)
 
     left_source = DMTacSource(raw_root, "left")
     right_source = DMTacSource(raw_root, "right")
@@ -251,6 +267,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     referenced_right: set[int] = set()
     global_index = 0
     front_shape: list[int] | None = None
+    front_source_shape: list[int] | None = None
     wrist_shape: list[int] | None = None
     grid_reference: np.ndarray | None = None
 
@@ -379,13 +396,27 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         }
         for path in video_paths.values():
             path.parent.mkdir(parents=True, exist_ok=True)
-        _write_path_video(front_paths, video_paths[IMAGE_KEY], fps_value, video_codec)
+        _write_path_video(
+            front_paths,
+            video_paths[IMAGE_KEY],
+            fps_value,
+            video_codec,
+            crop_xyxy=front_crop,
+        )
         _write_path_video(wrist_paths, video_paths[WRIST_IMAGE_KEY], fps_value, video_codec)
 
+        current_front_source_shape = _image_shape(front_paths[0])
+        current_front_shape = _cropped_image_shape(current_front_source_shape, front_crop)
+        current_wrist_shape = _image_shape(wrist_paths[0])
         if front_shape is None:
-            front_shape = _image_shape(front_paths[0])
-            wrist_shape = _image_shape(wrist_paths[0])
-        elif _image_shape(front_paths[0]) != front_shape or _image_shape(wrist_paths[0]) != wrist_shape:
+            front_source_shape = current_front_source_shape
+            front_shape = current_front_shape
+            wrist_shape = current_wrist_shape
+        elif (
+            current_front_source_shape != front_source_shape
+            or current_front_shape != front_shape
+            or current_wrist_shape != wrist_shape
+        ):
             raise ValueError("all episodes must use consistent RGB image shapes")
 
         length = len(episode_rows)
@@ -405,7 +436,13 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         timing["left_tactile_unique_ratio"] = _unique_ratio(left_frame_ids)
         timing["right_tactile_unique_ratio"] = _unique_ratio(right_frame_ids)
 
-    if not episode_metadata or front_shape is None or wrist_shape is None or grid_reference is None:
+    if (
+        not episode_metadata
+        or front_source_shape is None
+        or front_shape is None
+        or wrist_shape is None
+        or grid_reference is None
+    ):
         raise RuntimeError(f"no frames exported from {raw_root}")
 
     info = _build_info(
@@ -438,6 +475,13 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         "timing_reports": timing_reports,
         "source_episode_metadata": source_episode_metadata,
         "source_tactile_schema_versions": sorted(schema_versions),
+        "front_image_crop": {
+            "enabled": front_crop is not None,
+            "coordinate_convention": "xyxy; x1/y1 exclusive",
+            "roi_xyxy": list(front_crop) if front_crop is not None else None,
+            "source_shape": front_source_shape,
+            "output_shape": front_shape,
+        },
         "marker_field": {
             "shape": list(MARKER_SHAPE),
             "history_length": HISTORY_LENGTH,
@@ -485,6 +529,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         "total_frames": global_index,
         "total_episodes": len(episode_metadata),
         "timing_policy": timing_policy,
+        "front_image_crop": conversion["front_image_crop"],
         "validation": validation,
         "conversion_report": str(out_root / "meta" / "tabero_conversion.json"),
     }
@@ -709,17 +754,73 @@ def _hf_schema_metadata() -> dict[bytes, bytes]:
     return {b"huggingface": json.dumps({"info": {"features": features}}).encode("utf-8")}
 
 
-def _write_path_video(paths: Iterable[Path], out_path: Path, fps: float, codec: str) -> None:
+def _normalize_front_crop(
+    crop_xyxy: tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int] | None:
+    if crop_xyxy is None:
+        return None
+    if len(crop_xyxy) != 4:
+        raise ValueError("front_crop must contain exactly four integers: x0 y0 x1 y1")
+    x0, y0, x1, y1 = (int(value) for value in crop_xyxy)
+    if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0:
+        raise ValueError(
+            "front_crop must satisfy 0 <= x0 < x1 and 0 <= y0 < y1; "
+            f"got {(x0, y0, x1, y1)}"
+        )
+    return x0, y0, x1, y1
+
+
+def _cropped_image_shape(
+    source_shape: list[int],
+    crop_xyxy: tuple[int, int, int, int] | None,
+) -> list[int]:
+    if crop_xyxy is None:
+        return list(source_shape)
+    height, width, channels = (int(value) for value in source_shape)
+    x0, y0, x1, y1 = crop_xyxy
+    if x1 > width or y1 > height:
+        raise ValueError(
+            f"front_crop {(x0, y0, x1, y1)} exceeds source image {width}x{height}"
+        )
+    return [y1 - y0, x1 - x0, channels]
+
+
+def _crop_rgb(
+    rgb: np.ndarray,
+    crop_xyxy: tuple[int, int, int, int] | None,
+    source: Path,
+) -> np.ndarray:
+    if crop_xyxy is None:
+        return np.ascontiguousarray(rgb)
+    output_shape = _cropped_image_shape(
+        [int(rgb.shape[0]), int(rgb.shape[1]), int(rgb.shape[2])],
+        crop_xyxy,
+    )
+    x0, y0, x1, y1 = crop_xyxy
+    cropped = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+    if list(cropped.shape) != output_shape:
+        raise ValueError(f"failed to crop {source} to expected shape {output_shape}")
+    return cropped
+
+
+def _write_path_video(
+    paths: Iterable[Path],
+    out_path: Path,
+    fps: float,
+    codec: str,
+    *,
+    crop_xyxy: tuple[int, int, int, int] | None = None,
+) -> None:
     paths = list(paths)
     if not paths:
         raise ValueError(f"no frames for {out_path}")
     with Image.open(paths[0]) as image:
-        first = np.asarray(image.convert("RGB"))
+        first = _crop_rgb(np.asarray(image.convert("RGB")), crop_xyxy, paths[0])
     writer = _open_video_writer(out_path, first.shape, fps, codec)
     try:
         for path in paths:
             with Image.open(path) as image:
-                rgb = np.asarray(image.convert("RGB"))
+                rgb = _crop_rgb(np.asarray(image.convert("RGB")), crop_xyxy, path)
             if rgb.shape != first.shape:
                 raise ValueError(f"{path} shape {rgb.shape} != first frame {first.shape}")
             writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
@@ -897,10 +998,19 @@ def validate_tabero_lerobot(root: Path) -> dict[str, Any]:
             if not cap.isOpened():
                 raise RuntimeError(f"cannot open video {video_path}")
             frame_count = int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            frame_width = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+            frame_height = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
             cap.release()
             if frame_count != length:
                 raise ValueError(
                     f"episode {expected_episode}: {video_key} frames {frame_count} != {length}"
+                )
+            expected_shape = info.get("features", {}).get(video_key, {}).get("shape")
+            actual_shape = [frame_height, frame_width, 3]
+            if expected_shape != actual_shape:
+                raise ValueError(
+                    f"episode {expected_episode}: {video_key} video shape "
+                    f"{actual_shape} != metadata {expected_shape}"
                 )
     if total_rows != int(info["total_frames"]):
         raise ValueError(f"total frame count {total_rows} != {info['total_frames']}")
