@@ -170,6 +170,7 @@ class RecordConfig:
     reject_unsynced_remote_stamp: bool
     timestamp_diagnostics_interval_sec: float
     require_unique_image_stamps: bool
+    discard_episode_on_active_skip: bool
 
     save_master_parquet_every_episode: bool
     save_debug_jsonl: bool
@@ -280,6 +281,9 @@ def load_config(path: str | Path) -> RecordConfig:
             1.0, float(sync.get("timestamp_diagnostics_interval_sec", 5.0))
         ),
         require_unique_image_stamps=bool(sync.get("require_unique_image_stamps", True)),
+        discard_episode_on_active_skip=bool(
+            record.get("discard_episode_on_active_skip", False)
+        ),
         save_master_parquet_every_episode=bool(
             output.get("save_master_parquet_every_episode", True)
         ),
@@ -746,6 +750,10 @@ def main() -> None:
     print(
         f"[WRITER] queue={cfg.write_queue_size} tasks "
         f"tactile_batch={cfg.tactile_batch_frames} frames"
+    )
+    print(
+        f"[EPISODE_QUALITY] discard_on_active_skip="
+        f"{cfg.discard_episode_on_active_skip}"
     )
     print(
         f"[DM-TAC W] SDK 0.1.4 packed schema version: {cfg.tactile_schema_version} "

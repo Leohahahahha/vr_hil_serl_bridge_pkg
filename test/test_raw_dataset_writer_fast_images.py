@@ -98,6 +98,32 @@ class RawDatasetWriterFastImageTest(unittest.TestCase):
                 self.assertEqual(image.size, (16, 12))
                 self.assertEqual(image.mode, "RGB")
 
+    def test_discard_checkpoint_restores_raw_episode_logs(self) -> None:
+        writer = self.make_writer()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer.vr_log_path = root / "vr.jsonl"
+            writer.command_log_path = root / "command.jsonl"
+            writer.state_log_path = root / "state.jsonl"
+            writer.vr_log_path.write_bytes(b"committed-vr\n")
+            writer.command_log_path.write_bytes(b"committed-command\n")
+
+            writer.current_raw_log_checkpoints = (
+                writer._capture_raw_log_checkpoints()
+            )
+            with writer.vr_log_path.open("ab") as handle:
+                handle.write(b"discard-vr\n")
+            with writer.command_log_path.open("ab") as handle:
+                handle.write(b"discard-command\n")
+            writer.state_log_path.write_bytes(b"discard-state\n")
+            writer._restore_raw_log_checkpoints()
+
+            self.assertEqual(writer.vr_log_path.read_bytes(), b"committed-vr\n")
+            self.assertEqual(
+                writer.command_log_path.read_bytes(), b"committed-command\n"
+            )
+            self.assertFalse(writer.state_log_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

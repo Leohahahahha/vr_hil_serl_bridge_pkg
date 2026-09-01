@@ -135,6 +135,7 @@ try:
     )
     from .raw_dataset_writer import PAXINI_RAW_WRITER_PROFILE, RawDatasetWriter
     from .stream_sampling import (
+        candidate_continuity_report,
         has_usable_action_label,
         nearest_time_ordered,
         ros_message_stamp_ns,
@@ -154,6 +155,7 @@ except ImportError:
     )
     from raw_dataset_writer import PAXINI_RAW_WRITER_PROFILE, RawDatasetWriter  # type: ignore
     from stream_sampling import (  # type: ignore
+        candidate_continuity_report,
         has_usable_action_label,
         nearest_time_ordered,
         ros_message_stamp_ns,
@@ -1007,6 +1009,34 @@ def record_episode(
         f"pre_action_reasons={dict(pre_action_skip_reasons)} "
         f"active_reasons={dict(active_skip_reasons)}"
     )
+
+    continuity = candidate_continuity_report(
+        row["candidate_index"] for row in writer.current_episode_rows
+    )
+    print(
+        f"[EPISODE_QUALITY] saved={continuity.saved_frames} "
+        f"first_candidate={continuity.first_candidate} "
+        f"last_candidate={continuity.last_candidate} "
+        f"internal_missing={continuity.internal_missing} "
+        f"duplicates={continuity.duplicate_steps} "
+        f"backwards={continuity.backwards_steps} "
+        f"active_skipped={active_skip_count}"
+    )
+    reject_on_active_skip = bool(
+        getattr(cfg, "discard_episode_on_active_skip", False)
+    )
+    quality_failed = active_skip_count > 0 or not continuity.continuous
+    if reject_on_active_skip and quality_failed:
+        print(
+            f"[QUALITY_REJECT] episode {episode_index} was not committed: "
+            f"active_skipped={active_skip_count}, "
+            f"internal_missing={continuity.internal_missing}, "
+            f"duplicates={continuity.duplicate_steps}, "
+            f"backwards={continuity.backwards_steps}. "
+            "Reset the scene and re-record the same episode index."
+        )
+        writer.discard_episode()
+        return False, controller.quit
 
     writer.commit_episode(episode_index)
     if cfg.save_master_parquet_every_episode:

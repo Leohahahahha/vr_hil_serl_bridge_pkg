@@ -152,6 +152,9 @@ class RawDatasetWriter:
         self.current_tactile_right_records: list[dict[str, Any]] = []
         self.current_tactile_left_start: Optional[int] = None
         self.current_tactile_right_start: Optional[int] = None
+        self.current_raw_log_checkpoints: Optional[
+            dict[Path, tuple[bool, int]]
+        ] = None
 
         self._async_frame_writes = bool(profile.stream_tactile)
         queue_size = max(4, int(getattr(cfg, "write_queue_size", 48)))
@@ -659,6 +662,8 @@ class RawDatasetWriter:
 
     def start_episode(self, episode_index: int) -> None:
         self.flush_pending_writes()
+        if self.current_raw_log_checkpoints is not None:
+            raise RuntimeError("previous episode must be committed or discarded first")
         self._reset_writer_stats()
         self.current_episode_rows = []
         self.current_image_records = []
@@ -678,6 +683,7 @@ class RawDatasetWriter:
             shutil.rmtree(wrist_tmp)
         wrist_tmp.mkdir(parents=True, exist_ok=True)
         self.current_tmp_wrist_image_dir = wrist_tmp
+        self.current_raw_log_checkpoints = self._capture_raw_log_checkpoints()
 
     def discard_episode(self) -> None:
         self.flush_pending_writes()
@@ -688,6 +694,7 @@ class RawDatasetWriter:
             shutil.rmtree(self.current_tmp_image_dir)
         if self.current_tmp_wrist_image_dir is not None and self.current_tmp_wrist_image_dir.exists():
             shutil.rmtree(self.current_tmp_wrist_image_dir)
+        self._restore_raw_log_checkpoints()
         self.current_tmp_image_dir = None
         self.current_tmp_wrist_image_dir = None
         self.current_episode_rows = []
@@ -697,6 +704,29 @@ class RawDatasetWriter:
         self.current_tactile_right_records = []
         self.current_tactile_left_start = None
         self.current_tactile_right_start = None
+        self.current_raw_log_checkpoints = None
+
+    def _raw_log_paths(self) -> tuple[Path, Path, Path]:
+        return self.vr_log_path, self.command_log_path, self.state_log_path
+
+    def _capture_raw_log_checkpoints(self) -> dict[Path, tuple[bool, int]]:
+        return {
+            path: (path.exists(), int(path.stat().st_size) if path.exists() else 0)
+            for path in self._raw_log_paths()
+        }
+
+    def _restore_raw_log_checkpoints(self) -> None:
+        if self.current_raw_log_checkpoints is None:
+            return
+        for path, (existed, size) in self.current_raw_log_checkpoints.items():
+            if not existed:
+                if path.exists():
+                    path.unlink()
+                continue
+            if not path.exists():
+                raise RuntimeError(f"cannot roll back missing raw episode log: {path}")
+            with path.open("r+b") as handle:
+                handle.truncate(size)
 
     @staticmethod
     def _tactile_zarr_row_count(zarr_path: Path) -> int:
@@ -1213,6 +1243,7 @@ class RawDatasetWriter:
         self.current_tactile_right_records = []
         self.current_tactile_left_start = None
         self.current_tactile_right_start = None
+        self.current_raw_log_checkpoints = None
 
     def flush_master(self) -> None:
         self.flush_pending_writes()

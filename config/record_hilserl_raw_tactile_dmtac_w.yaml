@@ -23,6 +23,10 @@ record:
   # Keep enough capture history to survive a temporary writer slowdown while
   # the performance fixes below are being verified on the real host.
   buffer_history_sec: 5.0
+  # Keep pre-action waiting candidates ignored, but reject an episode before
+  # commit when any candidate is skipped after the first usable action. The
+  # same episode index is then offered for re-recording, like r + Enter.
+  discard_episode_on_active_skip: true
 
 server:
   url: "http://172.31.179.19:5000"

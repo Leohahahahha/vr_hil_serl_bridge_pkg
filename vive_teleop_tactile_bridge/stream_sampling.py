@@ -3,10 +3,46 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, Optional, TypeVar
 
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class CandidateContinuityReport:
+    saved_frames: int
+    first_candidate: Optional[int]
+    last_candidate: Optional[int]
+    internal_missing: int
+    duplicate_steps: int
+    backwards_steps: int
+
+    @property
+    def continuous(self) -> bool:
+        return (
+            self.internal_missing == 0
+            and self.duplicate_steps == 0
+            and self.backwards_steps == 0
+        )
+
+
+def candidate_continuity_report(
+    candidate_indices: Iterable[int],
+) -> CandidateContinuityReport:
+    """Summarize continuity of the saved fixed-rate candidate sequence."""
+
+    values = [int(value) for value in candidate_indices]
+    steps = [current - previous for previous, current in zip(values, values[1:])]
+    return CandidateContinuityReport(
+        saved_frames=len(values),
+        first_candidate=values[0] if values else None,
+        last_candidate=values[-1] if values else None,
+        internal_missing=sum(max(step - 1, 0) for step in steps),
+        duplicate_steps=sum(step == 0 for step in steps),
+        backwards_steps=sum(step < 0 for step in steps),
+    )
 
 
 def nearest_time_ordered(

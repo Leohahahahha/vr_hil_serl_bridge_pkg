@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from vive_teleop_tactile_bridge.stream_sampling import (
+    candidate_continuity_report,
     has_usable_action_label,
     nearest_time_ordered,
     ros_message_stamp_ns,
@@ -26,6 +27,21 @@ def message(stamp_ns: int):
 
 
 class StreamSamplingTest(unittest.TestCase):
+    def test_candidate_continuity_reports_missing_duplicate_and_backwards(self) -> None:
+        report = candidate_continuity_report([4, 5, 7, 7, 6])
+        self.assertEqual(report.saved_frames, 5)
+        self.assertEqual(report.first_candidate, 4)
+        self.assertEqual(report.last_candidate, 6)
+        self.assertEqual(report.internal_missing, 1)
+        self.assertEqual(report.duplicate_steps, 1)
+        self.assertEqual(report.backwards_steps, 1)
+        self.assertFalse(report.continuous)
+
+    def test_candidate_continuity_accepts_clean_sequence(self) -> None:
+        report = candidate_continuity_report([8, 9, 10])
+        self.assertTrue(report.continuous)
+        self.assertEqual(report.internal_missing, 0)
+
     def test_nearest_prefers_newer_item_on_tie(self) -> None:
         items = [Item(0.9, "old"), Item(1.1, "new")]
         self.assertEqual(nearest_time_ordered(items, 1.0).payload, "new")
