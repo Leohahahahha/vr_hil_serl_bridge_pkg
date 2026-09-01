@@ -111,6 +111,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Allowed error around 1/fps in strict mode (default: 0.25/fps)",
     )
     parser.add_argument(
+        "--exclude-episodes",
+        type=int,
+        nargs="+",
+        default=(),
+        metavar="INDEX",
+        help=(
+            "Source raw episode indices to omit from the export. The raw dataset "
+            "is never modified and output episode indices are renumbered contiguously."
+        ),
+    )
+    parser.add_argument(
         "--max-tactile-sync-sec",
         type=float,
         default=0.15,
@@ -177,6 +188,7 @@ def main() -> None:
         task=args.task,
         timing_policy=args.timing_policy,
         timing_tolerance_sec=args.timing_tolerance_sec,
+        exclude_episodes=args.exclude_episodes,
         max_tactile_sync_sec=args.max_tactile_sync_sec,
         shear_scale=args.shear_scale,
         state_gripper_unit=args.state_gripper_unit,
@@ -199,6 +211,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     task: str | None = None,
     timing_policy: str = "strict",
     timing_tolerance_sec: float | None = None,
+    exclude_episodes: Iterable[int] = (),
     max_tactile_sync_sec: float = 0.15,
     shear_scale: float = 1.0,
     state_gripper_unit: str = "meter",
@@ -247,9 +260,32 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     left_source = DMTacSource(raw_root, "left")
     right_source = DMTacSource(raw_root, "right")
     source_episode_metadata = _source_episode_metadata_report(raw_root)
-    episode_paths = _find_episode_parquets(raw_root)
-    if not episode_paths:
+    all_episode_paths = _find_episode_parquets(raw_root)
+    if not all_episode_paths:
         raise FileNotFoundError(f"no episode parquet files found below {raw_root / 'data'}")
+    episode_path_by_index = {
+        _source_episode_index(path): path for path in all_episode_paths
+    }
+    if len(episode_path_by_index) != len(all_episode_paths):
+        raise ValueError("source episode parquet filenames contain duplicate indices")
+    excluded_source_episode_indices = sorted({int(value) for value in exclude_episodes})
+    if any(value < 0 for value in excluded_source_episode_indices):
+        raise ValueError("exclude_episodes values must be non-negative")
+    missing_exclusions = sorted(
+        set(excluded_source_episode_indices) - set(episode_path_by_index)
+    )
+    if missing_exclusions:
+        raise ValueError(
+            f"exclude_episodes not found in source dataset: {missing_exclusions}; "
+            f"available={sorted(episode_path_by_index)}"
+        )
+    episode_paths = [
+        path
+        for source_index, path in sorted(episode_path_by_index.items())
+        if source_index not in excluded_source_episode_indices
+    ]
+    if not episode_paths:
+        raise ValueError("exclude_episodes removed every source episode")
     if timing_policy == "strict" and source_episode_metadata["duplicate_episode_indices"]:
         raise ValueError(
             "source meta/episodes.jsonl contains duplicate episode_index values: "
@@ -272,6 +308,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     grid_reference: np.ndarray | None = None
 
     for raw_episode_path in episode_paths:
+        source_episode_index = _source_episode_index(raw_episode_path)
         df = pd.read_parquet(raw_episode_path)
         _require_columns(
             df,
@@ -295,6 +332,11 @@ def export_raw_dmtac_w_to_tabero_lerobot(
 
         timing = _timing_report(df, fps_value, timing_tolerance)
         timing["raw_episode"] = str(raw_episode_path.relative_to(raw_root))
+        timing["source_episode_index"] = int(source_episode_index)
+        timing["output_episode_index"] = int(len(episode_metadata))
+        timing["compacted"] = bool(
+            timing_policy == "compact" and not timing["strict_ok"]
+        )
         timing_reports.append(timing)
         if timing_policy == "strict" and not timing["strict_ok"]:
             raise ValueError(
@@ -464,7 +506,7 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     _write_jsonlines(out_root / "meta" / "episodes_stats.jsonl", episode_stats)
 
     conversion = {
-        "version": 1,
+        "version": 2,
         "source_raw_root": str(raw_root),
         "source_dataset_type": raw_info.get("dataset_type"),
         "output_contract": "tabero_action_only_lerobot_v2.1",
@@ -472,6 +514,25 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         "retained_but_unused_first_loader": [WRENCH_KEY, DEPTH_KEY],
         "timing_policy": timing_policy,
         "timing_compacted": timing_policy == "compact",
+        "excluded_source_episode_indices": excluded_source_episode_indices,
+        "converted_source_episode_indices": [
+            int(report["source_episode_index"]) for report in timing_reports
+        ],
+        "compacted_source_episode_indices": [
+            int(report["source_episode_index"])
+            for report in timing_reports
+            if report["compacted"]
+        ],
+        "total_missing_candidate_steps": int(
+            sum(report["missing_candidate_steps"] for report in timing_reports)
+        ),
+        "source_to_output_episode_index": [
+            {
+                "source_episode_index": int(report["source_episode_index"]),
+                "output_episode_index": int(report["output_episode_index"]),
+            }
+            for report in timing_reports
+        ],
         "timing_reports": timing_reports,
         "source_episode_metadata": source_episode_metadata,
         "source_tactile_schema_versions": sorted(schema_versions),
@@ -529,10 +590,29 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         "total_frames": global_index,
         "total_episodes": len(episode_metadata),
         "timing_policy": timing_policy,
+        "excluded_source_episode_indices": excluded_source_episode_indices,
+        "compacted_source_episode_indices": conversion[
+            "compacted_source_episode_indices"
+        ],
         "front_image_crop": conversion["front_image_crop"],
         "validation": validation,
         "conversion_report": str(out_root / "meta" / "tabero_conversion.json"),
     }
+
+
+def _source_episode_index(path: Path) -> int:
+    prefix = "episode_"
+    if path.name == "file-000.parquet":
+        # Preserve the legacy single-master fallback used by
+        # _find_episode_parquets. Episode selection beyond index 0 requires
+        # the normal data/episodes/episode_*.parquet layout.
+        return 0
+    if not path.stem.startswith(prefix):
+        raise ValueError(f"invalid source episode parquet name: {path.name}")
+    suffix = path.stem[len(prefix) :]
+    if not suffix.isdigit():
+        raise ValueError(f"invalid source episode parquet name: {path.name}")
+    return int(suffix)
 
 
 def _tabero_state_action(

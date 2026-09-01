@@ -230,6 +230,64 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
                         out_root=temp / "out",
                     )
 
+    def test_compact_export_excludes_source_episode_and_reports_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            raw_root = temp / "raw"
+            out_root = temp / "out"
+            _build_raw_dataset(raw_root)
+            episode = raw_root / "data" / "episodes" / "episode_000000.parquet"
+            frame = pd.read_parquet(episode)
+            frame.loc[1, "candidate_index"] = 2
+            frame.to_parquet(episode, index=False)
+
+            with mock.patch.object(tabero_export, "DMTacSource", _NpyDMTacSource):
+                result = export_raw_dmtac_w_to_tabero_lerobot(
+                    raw_root=raw_root,
+                    out_root=out_root,
+                    timing_policy="compact",
+                    exclude_episodes=[1],
+                )
+
+            self.assertEqual(result["total_episodes"], 1)
+            self.assertEqual(result["total_frames"], 2)
+            self.assertEqual(result["excluded_source_episode_indices"], [1])
+            self.assertEqual(result["compacted_source_episode_indices"], [0])
+            conversion = json.loads(
+                (out_root / "meta" / "tabero_conversion.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(conversion["version"], 2)
+            self.assertEqual(conversion["excluded_source_episode_indices"], [1])
+            self.assertEqual(conversion["converted_source_episode_indices"], [0])
+            self.assertEqual(conversion["compacted_source_episode_indices"], [0])
+            self.assertEqual(conversion["total_missing_candidate_steps"], 1)
+            self.assertEqual(conversion["timing_reports"][0]["source_episode_index"], 0)
+            self.assertEqual(conversion["timing_reports"][0]["output_episode_index"], 0)
+            self.assertEqual(conversion["timing_reports"][0]["missing_candidate_steps"], 1)
+            self.assertTrue(conversion["timing_reports"][0]["compacted"])
+
+    def test_exclude_episode_cli_parsing(self) -> None:
+        args = tabero_export.build_arg_parser().parse_args(
+            [
+                "--raw-root",
+                "/tmp/raw",
+                "--out-root",
+                "/tmp/out",
+                "--exclude-episodes",
+                "2",
+                "29",
+            ]
+        )
+        self.assertEqual(args.exclude_episodes, [2, 29])
+        self.assertEqual(
+            tabero_export._source_episode_index(
+                Path("data") / "chunk-000" / "file-000.parquet"
+            ),
+            0,
+        )
+
     def test_legacy_normalized_state_is_converted_to_finger_meters(self) -> None:
         row = pd.Series(
             {
