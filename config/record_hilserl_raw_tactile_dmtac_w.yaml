@@ -15,7 +15,9 @@ record:
   warmup_timeout_sec: 30.0
   task_description: "fr3 zed DM-Tac W SDK 0.1.4 raw teleop via hilserl franka_server"
   task_index: 0
-  wait_for_motion_enable_to_record: false
+  # Pause the logical episode timeline while the VR motion enable is released.
+  # Disabled wall-clock intervals create no rows or candidate-index gaps.
+  wait_for_motion_enable_to_record: true
   debug: true
   # Run camera, tactile, action and state callbacks concurrently. Heavy
   # packed-tactile copies no longer serialize both camera callbacks.

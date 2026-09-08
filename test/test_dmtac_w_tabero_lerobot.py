@@ -138,13 +138,17 @@ def _build_raw_dataset(root: Path) -> None:
                     "candidate_index": frame_index,
                     "frame_index": frame_index,
                     "observation.state": np.asarray(
-                        [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.025], dtype=np.float32
+                        [
+                            0.1 + episode_index + 0.01 * frame_index,
+                            0.2 + 0.02 * frame_index,
+                            0.3 + 0.03 * frame_index,
+                            0.0,
+                            0.0,
+                            0.1 * frame_index,
+                            0.020 + 0.001 * (episode_index + frame_index),
+                        ],
+                        dtype=np.float32,
                     ),
-                    "action.pose7": np.asarray(
-                        [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
-                    ),
-                    "action.target_gripper_width": 0.0425,
-                    "action.target_gripper_finger_position": 0.02125,
                     "robot.force": np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
                     "robot.torque": np.asarray([4.0, 5.0, 6.0], dtype=np.float32),
                     "image.path": str(image_rel),
@@ -175,7 +179,7 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
                 )
             self.assertTrue(result["ok"])
             self.assertEqual(result["total_episodes"], 2)
-            self.assertEqual(result["total_frames"], 5)
+            self.assertEqual(result["total_frames"], 3)
             self.assertEqual(validate_tabero_lerobot(out_root)["action_dim"], 7)
 
             info = json.loads((out_root / "meta" / "info.json").read_text(encoding="utf-8"))
@@ -187,6 +191,10 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
             self.assertEqual(info["gripper_unit"], "meter")
             self.assertEqual(info["gripper_coordinate"], "single_finger_absolute_position")
             self.assertAlmostEqual(info["gripper_max_finger_position_m"], 0.0425)
+            self.assertEqual(
+                info["action_supervision"],
+                "actions[t] = state[t+1] within each episode",
+            )
 
             episode0 = pq.read_table(out_root / "data" / "chunk-000" / "episode_000000.parquet")
             episode1 = pq.read_table(out_root / "data" / "chunk-000" / "episode_000001.parquet")
@@ -195,18 +203,36 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
             depth0 = np.asarray(episode0[DEPTH_KEY].to_pylist(), dtype=np.float32)
             actions0 = np.asarray(episode0[ACTION_KEY].to_pylist(), dtype=np.float32)
             states0 = np.asarray(episode0["state"].to_pylist(), dtype=np.float32)
+            actions1 = np.asarray(episode1[ACTION_KEY].to_pylist(), dtype=np.float32)
+            states1 = np.asarray(episode1["state"].to_pylist(), dtype=np.float32)
 
-            self.assertEqual(marker0.shape, (2, 9, 198, 2))
+            self.assertEqual(marker0.shape, (1, 9, 198, 2))
+            self.assertEqual(marker1.shape, (2, 9, 198, 2))
             self.assertTrue(np.array_equal(marker0[0, 1], marker0[0, 8]))
             self.assertTrue(np.array_equal(marker1[0, 1], marker1[0, 8]))
-            self.assertAlmostEqual(float(marker0[1, 8, 0, 0] - marker0[1, 0, 0, 0]), 1.0)
             self.assertAlmostEqual(float(marker1[0, 8, 0, 0] - marker1[0, 0, 0, 0]), 2.0)
             self.assertAlmostEqual(float(depth0[0, 0, 0, 0]), 100.0)
             self.assertAlmostEqual(float(depth0[0, 1, 0, 0]), 200.0)
-            np.testing.assert_allclose(states0[0, 6], 0.025)
+            np.testing.assert_allclose(states0[0, 6], 0.020)
             np.testing.assert_allclose(
                 actions0[0],
-                [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 0.02125],
+                [0.11, 0.22, 0.33, 0.0, 0.0, 0.1, 0.021],
+            )
+            np.testing.assert_allclose(actions1[0], states1[1])
+            np.testing.assert_allclose(
+                actions1[-1],
+                [1.12, 0.24, 0.36, 0.0, 0.0, 0.2, 0.023],
+            )
+
+            conversion = json.loads(
+                (out_root / "meta" / "tabero_conversion.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(conversion["version"], 3)
+            self.assertEqual(
+                conversion["action_source"],
+                "observation.state at the next source frame within the same episode",
             )
 
             hf_meta = json.loads(episode0.schema.metadata[b"huggingface"])
@@ -250,7 +276,7 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
                 )
 
             self.assertEqual(result["total_episodes"], 1)
-            self.assertEqual(result["total_frames"], 2)
+            self.assertEqual(result["total_frames"], 1)
             self.assertEqual(result["excluded_source_episode_indices"], [1])
             self.assertEqual(result["compacted_source_episode_indices"], [0])
             conversion = json.loads(
@@ -258,7 +284,7 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(conversion["version"], 2)
+            self.assertEqual(conversion["version"], 3)
             self.assertEqual(conversion["excluded_source_episode_indices"], [1])
             self.assertEqual(conversion["converted_source_episode_indices"], [0])
             self.assertEqual(conversion["compacted_source_episode_indices"], [0])
@@ -292,37 +318,29 @@ class DMTacTaberoLeRobotTest(unittest.TestCase):
         row = pd.Series(
             {
                 "observation.state": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
-                "action.pose7": [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0],
-                "action.target_gripper_width": 0.085,
             }
         )
-        state, action = tabero_export._tabero_state_action(
+        state = tabero_export._tabero_state(
             row,
             state_gripper_unit="normalized",
             state_gripper_coordinate="finger",
-            action_gripper_unit="meter",
             gripper_open_width_m=0.085,
         )
         self.assertAlmostEqual(float(state[6]), 0.0425)
-        self.assertAlmostEqual(float(action[6]), 0.0425)
 
-    def test_rejects_inconsistent_explicit_target_finger_position(self) -> None:
+    def test_state_conversion_does_not_read_command_columns(self) -> None:
         row = pd.Series(
             {
                 "observation.state": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.02],
-                "action.pose7": [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0],
-                "action.target_gripper_width": 0.04,
-                "action.target_gripper_finger_position": 0.03,
             }
         )
-        with self.assertRaisesRegex(ValueError, "does not equal"):
-            tabero_export._tabero_state_action(
-                row,
-                state_gripper_unit="meter",
-                state_gripper_coordinate="finger",
-                action_gripper_unit="meter",
-                gripper_open_width_m=0.085,
-            )
+        state = tabero_export._tabero_state(
+            row,
+            state_gripper_unit="meter",
+            state_gripper_coordinate="finger",
+            gripper_open_width_m=0.085,
+        )
+        self.assertAlmostEqual(float(state[6]), 0.02)
 
 
 if __name__ == "__main__":

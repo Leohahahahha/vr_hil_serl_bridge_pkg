@@ -114,6 +114,13 @@ callback delay is not mistaken for camera capture time. The Franka HTTP bridge
 publishes a 20 Hz held-action heartbeat without sending extra HTTP requests;
 real HTTP command events remain separately marked with `heartbeat=false`.
 
+With the DM-Tac W recorder's `wait_for_motion_enable_to_record: true`, releasing
+the VR motion-enable control pauses the logical episode timeline. Disabled
+wall-clock intervals write no rows, do not consume candidate indices, and do
+not count as active data-loss skips; recording resumes in the same episode with
+continuous 10 Hz timestamps. The wall-clock `max_episode_sec` safety deadline
+still applies while paused.
+
 PNG encoding and tactile writes run on a bounded background queue. Left/right
 zarr arrays are resized and appended in aligned batches (eight frames by
 default), and episode commit/discard waits for a writer barrier before changing
@@ -130,8 +137,10 @@ Tabero keys:
 - `image`, `wrist_image`: the ZED and D405 RGB streams.
 - `state`: float32 `[7]`, xyz + axis-angle + measured single-finger absolute
   position in meters (`robot.gripper_width / 2`).
-- `actions`: float32 `[7]`, absolute target xyz + axis-angle + target
-  single-finger absolute position in meters (`target_gripper_width / 2`).
+- `actions`: float32 `[7]`, the next synchronized robot state in the same
+  episode: `actions[t] = state[t+1]`. VR targets and sent command fields are not
+  used. The final source frame supplies the last label and is not emitted as an
+  observation because it has no following state.
 - `tactile_marker_motion`: float32 `[9,198,2]`. Slice 0 is the fixed 9x11
   marker reference grid from each finger; slices 1:9 are the last eight
   `reference + DM-Tac shear` frames, padded with episode frame 0 at startup.
@@ -161,8 +170,8 @@ ros2 run vive_teleop_tactile_bridge validate_tabero_lerobot \
 The converter writes the Tabero gripper slot only as a physical single-finger
 position in meters. New recordings already carry that contract. For a legacy
 recording whose `observation.state[6]` is the normalized 0--1 value, add
-`--state-gripper-unit normalized`; its action total-width fallback is still
-halved automatically.
+`--state-gripper-unit normalized`. The legacy `--action-gripper-unit` option is
+accepted for command compatibility but is ignored by state-derived actions.
 
 The default `--timing-policy strict` refuses missing candidates or irregular
 source timing. `--timing-policy compact` exists only for a file-format smoke

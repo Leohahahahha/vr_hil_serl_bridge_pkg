@@ -48,46 +48,36 @@ class TaberoGripperContractLightweightTest(unittest.TestCase):
     def row(self, **updates) -> pd.Series:
         values = {
             "observation.state": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.025],
-            "action.pose7": [0.4, 0.5, 0.6, 0.0, 0.0, 0.0, 1.0],
-            "action.target_gripper_width": 0.04,
-            "action.target_gripper_finger_position": 0.02,
         }
         values.update(updates)
         return pd.Series(values)
 
     def convert(self, row: pd.Series, *, state_unit="meter"):
-        return tabero_export._tabero_state_action(
+        return tabero_export._tabero_state(
             row,
             state_gripper_unit=state_unit,
             state_gripper_coordinate="finger",
-            action_gripper_unit="meter",
             gripper_open_width_m=0.085,
         )
 
-    def test_writes_state_and_action_as_finger_meters(self) -> None:
-        state, action = self.convert(self.row())
+    def test_writes_state_as_finger_meters(self) -> None:
+        state = self.convert(self.row())
         self.assertAlmostEqual(float(state[6]), 0.025)
-        self.assertAlmostEqual(float(action[6]), 0.02)
 
-    def test_legacy_normalized_state_and_total_width_fallback(self) -> None:
-        state, action = self.convert(
+    def test_legacy_normalized_state(self) -> None:
+        state = self.convert(
             self.row(
                 **{
                     "observation.state": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0],
-                    "action.target_gripper_width": 0.085,
-                    "action.target_gripper_finger_position": None,
                 }
             ),
             state_unit="normalized",
         )
         self.assertAlmostEqual(float(state[6]), 0.0425)
-        self.assertAlmostEqual(float(action[6]), 0.0425)
 
-    def test_rejects_inconsistent_explicit_finger_position(self) -> None:
-        with self.assertRaisesRegex(ValueError, "does not equal"):
-            self.convert(
-                self.row(**{"action.target_gripper_finger_position": 0.03})
-            )
+    def test_command_fields_are_irrelevant(self) -> None:
+        state = self.convert(self.row(**{"action.pose7": "invalid"}))
+        self.assertAlmostEqual(float(state[6]), 0.025)
 
 
 if __name__ == "__main__":

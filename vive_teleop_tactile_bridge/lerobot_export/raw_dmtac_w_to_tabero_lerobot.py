@@ -5,8 +5,8 @@ This is the action-only first-reproduction contract:
 
 * ``image`` and ``wrist_image`` are RGB videos.
 * ``state`` is 7D xyz + axis-angle + measured single-finger position in meters.
-* ``actions`` is the 7D absolute target xyz + axis-angle + target
-  single-finger position in meters.
+* ``actions[t]`` is the next synchronized robot state ``state[t+1]``.  It is
+  independent of VR targets and HTTP command events.
 * ``tactile_marker_motion`` is [9, 198, 2]: a reference marker grid followed
   by eight current-position history frames.  Dense DM-Tac shear is sampled on
   a 9x11 grid per finger and converted to current positions as grid + shear.
@@ -81,13 +81,13 @@ STATE_NAMES = [
     "gripper_finger_position_m",
 ]
 ACTION_NAMES = [
-    "target_x",
-    "target_y",
-    "target_z",
-    "target_axis_angle_x",
-    "target_axis_angle_y",
-    "target_axis_angle_z",
-    "target_gripper_finger_position_m",
+    "next_x",
+    "next_y",
+    "next_z",
+    "next_axis_angle_x",
+    "next_axis_angle_y",
+    "next_axis_angle_z",
+    "next_gripper_finger_position_m",
 ]
 WRENCH_NAMES = ["force_x", "force_y", "force_z", "torque_x", "torque_y", "torque_z"]
 
@@ -149,7 +149,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--action-gripper-unit",
         choices=("normalized", "meter"),
         default="meter",
-        help="Unit of raw action.target_gripper_width",
+        help="Deprecated compatibility option; state-derived actions ignore command gripper fields",
     )
     parser.add_argument(
         "--gripper-output-unit",
@@ -255,6 +255,9 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         raise ValueError("Tabero state/actions gripper output must use physical meters")
     if len(video_codec) != 4:
         raise ValueError("video_codec must be a four-character FourCC value")
+    # Retain the public argument so existing conversion commands keep working.
+    # Command gripper fields are deliberately not read for state-derived labels.
+    _ = action_gripper_unit
     front_crop = _normalize_front_crop(front_crop)
 
     left_source = DMTacSource(raw_root, "left")
@@ -316,8 +319,6 @@ def export_raw_dmtac_w_to_tabero_lerobot(
                 "timestamp",
                 "frame_index",
                 "observation.state",
-                "action.pose7",
-                "action.target_gripper_width",
                 "robot.force",
                 "robot.torque",
                 "image.path",
@@ -329,6 +330,11 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         )
         if df.empty:
             continue
+        if len(df) < 2:
+            raise ValueError(
+                f"{raw_episode_path} has {len(df)} frame; at least 2 are required "
+                "for action[t] = state[t+1] supervision"
+            )
 
         timing = _timing_report(df, fps_value, timing_tolerance)
         timing["raw_episode"] = str(raw_episode_path.relative_to(raw_root))
@@ -354,8 +360,19 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         depth_frames: list[np.ndarray] = []
         left_frame_ids: list[int] = []
         right_frame_ids: list[int] = []
+        converted_states = [
+            _tabero_state(
+                raw_row,
+                state_gripper_unit=state_gripper_unit,
+                state_gripper_coordinate=state_gripper_coordinate,
+                gripper_open_width_m=gripper_open_width_m,
+            )
+            for _, raw_row in df.iterrows()
+        ]
 
-        for frame_index, (_, raw_row) in enumerate(df.iterrows()):
+        # The terminal raw frame supplies the final next-state target but is not
+        # itself exported because no state[t+1] label exists for it.
+        for frame_index, (_, raw_row) in enumerate(df.iloc[:-1].iterrows()):
             left_index = int(raw_row["tactile.left.zarr_index"])
             right_index = int(raw_row["tactile.right.zarr_index"])
             left_meta = left_source.metadata(left_index)
@@ -394,13 +411,8 @@ def export_raw_dmtac_w_to_tabero_lerobot(
             front_paths.append(front_path)
             wrist_paths.append(wrist_path)
 
-            state, action = _tabero_state_action(
-                raw_row,
-                state_gripper_unit=state_gripper_unit,
-                state_gripper_coordinate=state_gripper_coordinate,
-                action_gripper_unit=action_gripper_unit,
-                gripper_open_width_m=gripper_open_width_m,
-            )
+            state = converted_states[frame_index]
+            action = converted_states[frame_index + 1].copy()
             wrench = np.concatenate(
                 [
                     _vector(raw_row["robot.force"], 3, "robot.force"),
@@ -506,11 +518,14 @@ def export_raw_dmtac_w_to_tabero_lerobot(
     _write_jsonlines(out_root / "meta" / "episodes_stats.jsonl", episode_stats)
 
     conversion = {
-        "version": 2,
+        "version": 3,
         "source_raw_root": str(raw_root),
         "source_dataset_type": raw_info.get("dataset_type"),
         "output_contract": "tabero_action_only_lerobot_v2.1",
-        "action_target": "7D absolute xyz + axis-angle + gripper; no wrench supervision",
+        "action_target": "next synchronized state: 7D absolute xyz + axis-angle + gripper",
+        "action_source": "observation.state at the next source frame within the same episode",
+        "action_state_step_offset": 1,
+        "terminal_frame_policy": "omit final source observation; use it only as the previous frame action target",
         "retained_but_unused_first_loader": [WRENCH_KEY, DEPTH_KEY],
         "timing_policy": timing_policy,
         "timing_compacted": timing_policy == "compact",
@@ -569,8 +584,9 @@ def export_raw_dmtac_w_to_tabero_lerobot(
         "gripper": {
             "state_source_unit": state_gripper_unit,
             "state_source_coordinate": state_gripper_coordinate,
-            "action_source_unit": action_gripper_unit,
-            "action_source_coordinate": "total_width (legacy) or explicit finger field",
+            "action_source_unit": "converted next state output unit",
+            "action_source_coordinate": "converted next state single-finger coordinate",
+            "deprecated_action_gripper_unit_argument": action_gripper_unit,
             "output_unit": "meter",
             "output_coordinate": "single_finger_absolute_position",
             "open_width_m": float(gripper_open_width_m),
@@ -615,54 +631,26 @@ def _source_episode_index(path: Path) -> int:
     return int(suffix)
 
 
-def _tabero_state_action(
+def _tabero_state(
     row: pd.Series,
     *,
     state_gripper_unit: str,
     state_gripper_coordinate: str,
-    action_gripper_unit: str,
     gripper_open_width_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     state = _vector(row["observation.state"], STATE_DIM, "observation.state").copy()
-    target_pose = _vector(row["action.pose7"], 7, "action.pose7")
     state[6] = _source_gripper_to_finger_m(
         float(state[6]),
         unit=state_gripper_unit,
         coordinate=state_gripper_coordinate,
         gripper_open_width_m=gripper_open_width_m,
     )
-    explicit_finger = row.get("action.target_gripper_finger_position")
-    if explicit_finger is not None and not pd.isna(explicit_finger):
-        target_gripper = float(explicit_finger)
-        legacy_finger = _source_gripper_to_finger_m(
-            float(row["action.target_gripper_width"]),
-            unit=action_gripper_unit,
-            coordinate="total_width",
-            gripper_open_width_m=gripper_open_width_m,
-        )
-        if not np.isclose(target_gripper, legacy_finger, rtol=0.0, atol=1e-7):
-            raise ValueError(
-                "action.target_gripper_finger_position does not equal "
-                "action.target_gripper_width/2"
-            )
-    else:
-        target_gripper = _source_gripper_to_finger_m(
-            float(row["action.target_gripper_width"]),
-            unit=action_gripper_unit,
-            coordinate="total_width",
-            gripper_open_width_m=gripper_open_width_m,
-        )
-    action = np.concatenate(
-        [target_pose[:3], _quat_xyzw_to_rotvec(target_pose[3:7]), [target_gripper]]
-    ).astype(np.float32)
-    if not np.all(np.isfinite(state)) or not np.all(np.isfinite(action)):
-        raise ValueError("Tabero state/action contains non-finite values")
+    if not np.all(np.isfinite(state)):
+        raise ValueError("Tabero state contains non-finite values")
     max_finger_position = 0.5 * float(gripper_open_width_m)
     if state[6] < 0.0 or state[6] > max_finger_position + 1e-6:
         raise ValueError(f"state gripper finger position {state[6]} is outside physical range")
-    if action[6] < 0.0 or action[6] > max_finger_position + 1e-6:
-        raise ValueError(f"action gripper finger position {action[6]} is outside physical range")
-    return state.astype(np.float32), action
+    return state.astype(np.float32)
 
 
 def _source_gripper_to_finger_m(
@@ -686,21 +674,6 @@ def _source_gripper_to_finger_m(
     if coordinate == "total_width":
         return value / 2.0
     raise ValueError(f"unsupported gripper coordinate: {coordinate!r}")
-
-
-def _quat_xyzw_to_rotvec(quaternion: np.ndarray) -> np.ndarray:
-    q = np.asarray(quaternion, dtype=np.float64).reshape(4)
-    norm = float(np.linalg.norm(q))
-    if not np.isfinite(norm) or norm < 1e-12:
-        raise ValueError(f"invalid target quaternion: {q.tolist()}")
-    q /= norm
-    if q[3] < 0:
-        q = -q
-    vector_norm = float(np.linalg.norm(q[:3]))
-    if vector_norm < 1e-12:
-        return (2.0 * q[:3]).astype(np.float32)
-    angle = 2.0 * math.atan2(vector_norm, float(q[3]))
-    return (q[:3] * (angle / vector_norm)).astype(np.float32)
 
 
 def _sample_marker_positions(
@@ -997,7 +970,9 @@ def _build_info(
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         "features": features,
-        "action_supervision": "actions[7] only",
+        "action_supervision": "actions[t] = state[t+1] within each episode",
+        "action_source": "next synchronized robot observation state",
+        "terminal_frame_policy": "final source frame omitted from observations",
         "wrench_supervision": False,
         "gripper_unit": gripper_output_unit,
         "gripper_coordinate": "single_finger_absolute_position",
@@ -1060,6 +1035,10 @@ def validate_tabero_lerobot(root: Path) -> dict[str, Any]:
             raise ValueError(f"episode {expected_episode}: action shape {actions.shape}")
         if states.shape != (length, STATE_DIM):
             raise ValueError(f"episode {expected_episode}: state shape {states.shape}")
+        if length > 1 and not np.allclose(actions[:-1], states[1:], rtol=0.0, atol=1e-7):
+            raise ValueError(
+                f"episode {expected_episode}: actions are not aligned to the next exported state"
+            )
         if not np.all(np.isfinite(marker)) or not np.all(np.isfinite(depth)):
             raise ValueError(f"episode {expected_episode}: non-finite tactile data")
         max_finger_position = float(info["gripper_max_finger_position_m"])

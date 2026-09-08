@@ -135,6 +135,8 @@ try:
     )
     from .raw_dataset_writer import PAXINI_RAW_WRITER_PROFILE, RawDatasetWriter
     from .stream_sampling import (
+        EpisodeCandidateTimeline,
+        buffered_motion_enabled,
         candidate_continuity_report,
         has_usable_action_label,
         nearest_time_ordered,
@@ -155,6 +157,8 @@ except ImportError:
     )
     from raw_dataset_writer import PAXINI_RAW_WRITER_PROFILE, RawDatasetWriter  # type: ignore
     from stream_sampling import (  # type: ignore
+        EpisodeCandidateTimeline,
+        buffered_motion_enabled,
         candidate_continuity_report,
         has_usable_action_label,
         nearest_time_ordered,
@@ -677,7 +681,7 @@ def record_episode(
     period = 1.0 / cfg.fps
     ep_start = now_monotonic()
     next_t = ep_start
-    candidate_count = 0
+    candidate_timeline = EpisodeCandidateTimeline(period_sec=period)
     saved_count = 0
     skip_count = 0
     pre_action_skip_count = 0
@@ -729,9 +733,7 @@ def record_episode(
             t_frame = next_t
             loop_lag_sec = max(0.0, now - evaluation_time)
             max_loop_lag_sec = max(max_loop_lag_sec, loop_lag_sec)
-            timestamp = float(t_frame - ep_start)
             next_t += period
-            candidate_count += 1
 
             bundle = node.get_nearest_bundle(
                 t_frame,
@@ -742,6 +744,19 @@ def record_episode(
                     last_wrist_image_stamp_ns if require_unique_image_stamps else None
                 ),
             )
+            candidate_slot = candidate_timeline.accept(
+                motion_enabled=buffered_motion_enabled(bundle.get("enabled")),
+                pause_when_disabled=cfg.wait_for_motion_enable_to_record,
+            )
+            if candidate_slot is None:
+                if cfg.debug and candidate_timeline.paused_candidates % 20 == 0:
+                    print(
+                        f"[PAUSED] motion disabled; no episode frame recorded. "
+                        f"paused_candidates={candidate_timeline.paused_candidates}"
+                    )
+                continue
+            candidate_index = candidate_slot.index
+            timestamp = candidate_slot.timestamp
             action_ready = has_usable_action_label(
                 bundle.get("command"),
                 t_frame,
@@ -750,7 +765,7 @@ def record_episode(
             if action_ready and not active_started:
                 active_started = True
                 print(
-                    f"[ACTIVE] first valid action at candidate={candidate_count - 1} "
+                    f"[ACTIVE] first valid action at candidate={candidate_index} "
                     f"timestamp={timestamp:.3f}s"
                 )
             if active_started:
@@ -774,7 +789,7 @@ def record_episode(
                     print(f"[WARN] {build_result.reason}")
                 elif active_started:
                     print(
-                        f"[SKIP_ACTIVE] candidate={candidate_count - 1} "
+                        f"[SKIP_ACTIVE] candidate={candidate_index} "
                         f"timestamp={timestamp:.3f}s saved={saved_count} "
                         f"loop_lag_ms={loop_lag_sec * 1000.0:.1f} "
                         f"reason={build_result.reason}"
@@ -861,7 +876,7 @@ def record_episode(
                 "timestamp": np.float32(timestamp),
                 "wall_time": float(t_frame),
                 "frame_index": int(saved_count),
-                "candidate_index": int(candidate_count - 1),
+                "candidate_index": int(candidate_index),
                 "episode_index": int(episode_index),
                 "index": None,
                 "task_index": int(cfg.task_index),
@@ -944,7 +959,7 @@ def record_episode(
             vr_event: dict[str, Any] = {
                 "episode_index": int(episode_index),
                 "frame_index": int(saved_count),
-                "candidate_index": int(candidate_count - 1),
+                "candidate_index": int(candidate_index),
                 "timestamp": float(timestamp),
                 "wall_time": float(t_frame),
                 "image_path": image_rel_path,
@@ -1005,6 +1020,7 @@ def record_episode(
 
     print(
         f"[SKIP_SUMMARY] total={skip_count} pre_action={pre_action_skip_count} "
+        f"paused={candidate_timeline.paused_candidates} "
         f"active_candidates={active_candidate_count} active_skipped={active_skip_count} "
         f"pre_action_reasons={dict(pre_action_skip_reasons)} "
         f"active_reasons={dict(active_skip_reasons)}"

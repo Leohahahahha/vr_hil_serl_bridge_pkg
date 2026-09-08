@@ -28,6 +28,46 @@ class CandidateContinuityReport:
         )
 
 
+@dataclass(frozen=True)
+class EpisodeCandidateSlot:
+    index: int
+    timestamp: float
+
+
+@dataclass
+class EpisodeCandidateTimeline:
+    """Compact the logical episode timeline across intentional VR pauses."""
+
+    period_sec: float
+    next_index: int = 0
+    paused_candidates: int = 0
+
+    def accept(
+        self,
+        *,
+        motion_enabled: bool,
+        pause_when_disabled: bool,
+    ) -> Optional[EpisodeCandidateSlot]:
+        if pause_when_disabled and not motion_enabled:
+            self.paused_candidates += 1
+            return None
+        slot = EpisodeCandidateSlot(
+            index=int(self.next_index),
+            timestamp=float(self.next_index * self.period_sec),
+        )
+        self.next_index += 1
+        return slot
+
+
+def buffered_motion_enabled(item: Any) -> bool:
+    """Read the nearest buffered ``/vr_bridge/enabled`` sample safely."""
+
+    if item is None:
+        return False
+    payload = getattr(item, "payload", None)
+    return bool(payload.get("enabled", False)) if isinstance(payload, dict) else False
+
+
 def candidate_continuity_report(
     candidate_indices: Iterable[int],
 ) -> CandidateContinuityReport:

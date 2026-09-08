@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from vive_teleop_tactile_bridge.stream_sampling import (
+    EpisodeCandidateTimeline,
+    buffered_motion_enabled,
     candidate_continuity_report,
     has_usable_action_label,
     nearest_time_ordered,
@@ -27,6 +29,24 @@ def message(stamp_ns: int):
 
 
 class StreamSamplingTest(unittest.TestCase):
+    def test_disabled_vr_candidates_pause_the_logical_episode_timeline(self) -> None:
+        timeline = EpisodeCandidateTimeline(period_sec=0.1)
+        slots = [
+            timeline.accept(motion_enabled=enabled, pause_when_disabled=True)
+            for enabled in (True, True, False, False, True)
+        ]
+
+        self.assertEqual(
+            [None if slot is None else (slot.index, slot.timestamp) for slot in slots],
+            [(0, 0.0), (1, 0.1), None, None, (2, 0.2)],
+        )
+        self.assertEqual(timeline.paused_candidates, 2)
+
+    def test_motion_enable_requires_a_true_buffered_payload(self) -> None:
+        self.assertFalse(buffered_motion_enabled(None))
+        self.assertFalse(buffered_motion_enabled(Item(1.0, {"enabled": False})))
+        self.assertTrue(buffered_motion_enabled(Item(1.0, {"enabled": True})))
+
     def test_candidate_continuity_reports_missing_duplicate_and_backwards(self) -> None:
         report = candidate_continuity_report([4, 5, 7, 7, 6])
         self.assertEqual(report.saved_frames, 5)
